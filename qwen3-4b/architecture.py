@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from load_weights import load_weights
 
 
 class AttentionLayer(nn.Module):
@@ -12,12 +13,12 @@ class AttentionLayer(nn.Module):
         assert (
             num_q_heads % num_kv_heads == 0
         ), "make sure the num_q_heads is a multiple of num_kv_heads!"
-        self.O = nn.Linear(num_q_heads * head_dim, model_dim, bias=False)
-        self.W_Q = nn.Linear(model_dim, num_q_heads * head_dim, bias=False)
-        self.W_K = nn.Linear(model_dim, num_kv_heads * head_dim, bias=False)
-        self.W_V = nn.Linear(model_dim, num_kv_heads * head_dim, bias=False)
-        self.q_norm = nn.RMSNorm(head_dim)
-        self.k_norm = nn.RMSNorm(head_dim)
+        self.o_proj = nn.Linear(num_q_heads * head_dim, model_dim, bias=False)
+        self.q_proj = nn.Linear(model_dim, num_q_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(model_dim, num_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(model_dim, num_kv_heads * head_dim, bias=False)
+        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6)
+        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
         self.head_dim = head_dim
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
@@ -34,9 +35,9 @@ class AttentionLayer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         B, T, _ = x.shape
-        q: torch.Tensor = self.W_Q(x)
-        k: torch.Tensor = self.W_K(x)
-        v: torch.Tensor = self.W_V(x)
+        q: torch.Tensor = self.q_proj(x)
+        k: torch.Tensor = self.k_proj(x)
+        v: torch.Tensor = self.v_proj(x)
 
         q = q.view(B, T, self.num_q_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -66,20 +67,20 @@ class AttentionLayer(nn.Module):
         out = attention_scores @ v  # (B, num_heads, T, head_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
-        return self.O(out)
+        return self.o_proj(out)
 
 
 class MLPLayer(nn.Module):
     def __init__(self, model_dim: int, intermediate_dim: int):
         super().__init__()
-        self.l1 = nn.Linear(model_dim, intermediate_dim, bias=False)
-        self.l2 = nn.Linear(model_dim, intermediate_dim, bias=False)
-        self.l3 = nn.Linear(intermediate_dim, model_dim, bias=False)
+        self.gate_proj = nn.Linear(model_dim, intermediate_dim, bias=False)
+        self.up_proj = nn.Linear(model_dim, intermediate_dim, bias=False)
+        self.down_proj = nn.Linear(intermediate_dim, model_dim, bias=False)
 
     def forward(self, x: torch.Tensor):
-        gate = F.silu(self.l1(x))
-        data = self.l2(x)
-        return self.l3(gate * data)
+        gate = F.silu(self.gate_proj(x))
+        data = self.up_proj(x)
+        return self.down_proj(gate * data)
 
 
 class TransformerBlock(nn.Module):
@@ -92,23 +93,23 @@ class TransformerBlock(nn.Module):
         num_kv_heads: int,
     ):
         super().__init__()
-        self.attn = AttentionLayer(
+        self.self_attn = AttentionLayer(
             model_dim=model_dim,
             head_dim=head_dim,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
         )
-        self.attn_norm = nn.RMSNorm(model_dim)
+        self.input_layernorm = nn.RMSNorm(model_dim, eps=1e-6)
         self.mlp = MLPLayer(model_dim=model_dim, intermediate_dim=mlp_intermediate_dim)
-        self.mlp_norm = nn.RMSNorm(model_dim)
+        self.post_attention_layernorm = nn.RMSNorm(model_dim, eps=1e-6)
 
     def forward(self, x: torch.Tensor):
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.mlp(self.mlp_norm(x))
+        x = x + self.self_attn(self.input_layernorm(x))
+        x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
 
-class Qwen3_4B(nn.Module):
+class Qwen3Model(nn.Module):
     def __init__(
         self,
         model_dim: int,
@@ -120,29 +121,78 @@ class Qwen3_4B(nn.Module):
         num_layers: int,
     ):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList()
+        self.embed_tokens = nn.Embedding(vocab_size, model_dim)
+        self.layers = nn.ModuleList()
         for _ in range(num_layers):
-            self.blocks.append(
+            self.layers.append(
                 TransformerBlock(
                     model_dim, mlp_intermediate_dim, head_dim, num_q_heads, num_kv_heads
                 )
             )
-        self.final_norm = nn.RMSNorm(model_dim)
+        self.norm = nn.RMSNorm(model_dim, eps=1e-6)
 
     def forward(self, x: torch.Tensor):
-        x = self.embedding(x)
-        for block in self.blocks:
+        x = self.embed_tokens(x)
+        for block in self.layers:
             x = block(x)
-        x = self.final_norm(x)
-        x = F.linear(x, self.embedding.weight)
+        x = self.norm(x)
         return x
 
 
-B = 4
-T = 200
-d_model = 2048
-vocab_size = 100
-l = Qwen3_4B(d_model, d_model * 4, 512, 32, 8, vocab_size, 10)
-input = torch.randint(0, vocab_size - 1, (B, T))
-print(l.forward(input).shape)
+class Qwen3_4B(nn.Module):
+
+    def __init__(
+        self,
+        model_dim: int,
+        mlp_intermediate_dim: int,
+        head_dim: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        vocab_size: int,
+        num_layers: int,
+        tie_word_embeddings: bool = True,
+    ):
+        super().__init__()
+        self.model = Qwen3Model(
+            model_dim=model_dim,
+            mlp_intermediate_dim=mlp_intermediate_dim,
+            head_dim=head_dim,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            vocab_size=vocab_size,
+            num_layers=num_layers,
+        )
+        self.lm_head = (
+            nn.Linear(model_dim, vocab_size, bias=False)
+            if not tie_word_embeddings
+            else None
+        )
+
+    def forward(self, x: torch.Tensor):
+        x = self.model(x)
+        w = (
+            self.model.embed_tokens.weight
+            if self.lm_head is None
+            else self.lm_head.weight
+        )
+        return F.linear(x, w)
+
+
+model_dim = 2560
+mlp_intermediate_dim = 9728
+head_dim = 128
+num_q_heads = 32
+num_kv_heads = 8
+vocab_size = 151936
+num_layers = 36
+model = Qwen3_4B(
+    model_dim=model_dim,
+    mlp_intermediate_dim=mlp_intermediate_dim,
+    head_dim=head_dim,
+    num_q_heads=num_q_heads,
+    num_kv_heads=num_kv_heads,
+    vocab_size=vocab_size,
+    num_layers=num_layers,
+    tie_word_embeddings=True,
+)
+model.load_state_dict(load_weights())
