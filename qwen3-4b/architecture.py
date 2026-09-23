@@ -4,21 +4,23 @@ import torch.nn.functional as F
 import math
 
 
-class AttentionHead(nn.Module):
+class AttentionLayer(nn.Module):
     def __init__(
-        self,
-        head_dim: int,
-        W_Q: nn.Module,
-        W_K: nn.Module,
-        W_V: nn.Module,
+        self, model_dim: int, head_dim: int, num_q_heads: int, num_kv_heads: int
     ):
         super().__init__()
-        self.head_dim = head_dim
-        self.W_Q = W_Q
-        self.W_K = W_K
-        self.W_V = W_V
+        assert (
+            num_q_heads % num_kv_heads == 0
+        ), "make sure the num_q_heads is a multiple of num_kv_heads!"
+        self.O = nn.Linear(num_q_heads * head_dim, model_dim)
+        self.W_Q = nn.Linear(model_dim, num_q_heads * head_dim)
+        self.W_K = nn.Linear(model_dim, num_kv_heads * head_dim)
+        self.W_V = nn.Linear(model_dim, num_kv_heads * head_dim)
         self.q_norm = nn.RMSNorm(head_dim)
         self.k_norm = nn.RMSNorm(head_dim)
+        self.head_dim = head_dim
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
 
     def rope(self, x: torch.Tensor, positions: torch.Tensor, base=10000):
         assert self.head_dim % 2 == 0, "head_dim must be even for rope to work!"
@@ -31,60 +33,36 @@ class AttentionHead(nn.Module):
         return out
 
     def forward(self, x: torch.Tensor):
-        # (seq_len, head_dim)
         q: torch.Tensor = self.W_Q(x)
         k: torch.Tensor = self.W_K(x)
         v: torch.Tensor = self.W_V(x)
+
+        q = q.reshape(q.size(0), self.num_q_heads, q.size(1), self.head_dim)
+        k = torch.repeat_interleave(
+            k.reshape(k.size(0), self.num_kv_heads, k.size(1), self.head_dim),
+            self.num_q_heads // self.num_kv_heads,
+            dim=1,
+        )
+        v = torch.repeat_interleave(
+            v.reshape(v.size(0), self.num_kv_heads, v.size(1), self.head_dim),
+            self.num_q_heads // self.num_kv_heads,
+            dim=1,
+        )
 
         pos = torch.arange(q.size(-2))
         q = self.rope(self.q_norm(q), pos)
         k = self.rope(self.k_norm(k), pos)
 
-        attention_scores = q @ k.transpose(-1, -2)  # (seq_len, seq_len)
+        attention_scores = q @ k.transpose(-1, -2)  # (B, num_heads, T, T)
         mask = torch.tril(torch.ones(attention_scores.shape))
         attention_scores = attention_scores.masked_fill(mask == 0, float("-inf"))
         attention_scores /= math.sqrt(self.head_dim)
         attention_scores = attention_scores.softmax(dim=-1)  # softmax along q
 
-        out = attention_scores @ v  # (seq_len, head_dim)
-        return out
+        out = attention_scores @ v  # (B, num_heads, T, head_dim)
+        out = out.reshape(out.size(0), out.size(2), -1)
 
-
-class AttentionLayer(nn.Module):
-    def __init__(
-        self, model_dim: int, head_dim: int, num_q_heads: int, num_kv_heads: int
-    ):
-        super().__init__()
-        self.heads = nn.ModuleList()
-        self.O = nn.Linear(num_q_heads * head_dim, model_dim)
-        self.W_Qs = nn.ModuleList()
-        self.W_Ks = nn.ModuleList()
-        self.W_Vs = nn.ModuleList()
-        for _ in range(num_q_heads):
-            self.W_Qs.append(nn.Linear(model_dim, head_dim))
-        for _ in range(num_kv_heads):
-            self.W_Ks.append(nn.Linear(model_dim, head_dim))
-            self.W_Vs.append(nn.Linear(model_dim, head_dim))
-
-        assert (
-            num_q_heads % num_kv_heads == 0
-        ), "make sure the num_q_heads is a multiple of num_kv_heads!"
-        ratio = num_q_heads // num_kv_heads
-        for i in range(num_q_heads):
-            self.heads.append(
-                AttentionHead(
-                    head_dim=head_dim,
-                    W_Q=self.W_Qs[i],
-                    W_K=self.W_Ks[i // ratio],
-                    W_V=self.W_Vs[i // ratio],
-                )
-            )
-
-    def forward(self, x: torch.Tensor):
-        outs = []
-        for head in self.heads:
-            outs.append(head.forward(x))
-        return self.O(torch.cat(outs, dim=-1))
+        return self.O(out)
 
 
 class MLPLayer(nn.Module):
