@@ -20,14 +20,26 @@ class AttentionHead(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim)
         self.k_norm = nn.RMSNorm(head_dim)
 
+    def rope(self, x: torch.Tensor, positions: torch.Tensor, base=10000):
+        assert self.head_dim % 2 == 0, "head_dim must be even for rope to work!"
+        inv_freq = base ** (-torch.arange(0, self.head_dim, 2) / self.head_dim)
+        angles = positions[:, None] * inv_freq[None, :]
+        cos, sin = angles.cos(), angles.sin()
+
+        x1, x2 = x[..., : self.head_dim // 2], x[..., self.head_dim // 2 :]
+        out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+        return out
+
     def forward(self, x: torch.Tensor):
         # (seq_len, head_dim)
         q: torch.Tensor = self.W_Q(x)
         k: torch.Tensor = self.W_K(x)
         v: torch.Tensor = self.W_V(x)
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        pos = torch.arange(q.size(-2))
+        q = self.rope(self.q_norm(q), pos)
+        k = self.rope(self.k_norm(k), pos)
+
         attention_scores = q @ k.transpose(-1, -2)  # (seq_len, seq_len)
         mask = torch.tril(torch.ones(attention_scores.shape))
         attention_scores = attention_scores.masked_fill(mask == 0, float("-inf"))
