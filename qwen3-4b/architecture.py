@@ -12,17 +12,17 @@ class AttentionLayer(nn.Module):
         assert (
             num_q_heads % num_kv_heads == 0
         ), "make sure the num_q_heads is a multiple of num_kv_heads!"
-        self.O = nn.Linear(num_q_heads * head_dim, model_dim)
-        self.W_Q = nn.Linear(model_dim, num_q_heads * head_dim)
-        self.W_K = nn.Linear(model_dim, num_kv_heads * head_dim)
-        self.W_V = nn.Linear(model_dim, num_kv_heads * head_dim)
+        self.O = nn.Linear(num_q_heads * head_dim, model_dim, bias=False)
+        self.W_Q = nn.Linear(model_dim, num_q_heads * head_dim, bias=False)
+        self.W_K = nn.Linear(model_dim, num_kv_heads * head_dim, bias=False)
+        self.W_V = nn.Linear(model_dim, num_kv_heads * head_dim, bias=False)
         self.q_norm = nn.RMSNorm(head_dim)
         self.k_norm = nn.RMSNorm(head_dim)
         self.head_dim = head_dim
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
 
-    def rope(self, x: torch.Tensor, positions: torch.Tensor, base=10000):
+    def rope(self, x: torch.Tensor, positions: torch.Tensor, base=1000000):
         assert self.head_dim % 2 == 0, "head_dim must be even for rope to work!"
         inv_freq = base ** (-torch.arange(0, self.head_dim, 2) / self.head_dim)
         angles = positions[:, None] * inv_freq[None, :]
@@ -33,18 +33,22 @@ class AttentionLayer(nn.Module):
         return out
 
     def forward(self, x: torch.Tensor):
+        B, T, _ = x.shape
         q: torch.Tensor = self.W_Q(x)
         k: torch.Tensor = self.W_K(x)
         v: torch.Tensor = self.W_V(x)
 
-        q = q.reshape(q.size(0), self.num_q_heads, q.size(1), self.head_dim)
+        q = q.view(B, T, self.num_q_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
         k = torch.repeat_interleave(
-            k.reshape(k.size(0), self.num_kv_heads, k.size(1), self.head_dim),
+            k,
             self.num_q_heads // self.num_kv_heads,
             dim=1,
         )
         v = torch.repeat_interleave(
-            v.reshape(v.size(0), self.num_kv_heads, v.size(1), self.head_dim),
+            v,
             self.num_q_heads // self.num_kv_heads,
             dim=1,
         )
@@ -60,7 +64,7 @@ class AttentionLayer(nn.Module):
         attention_scores = attention_scores.softmax(dim=-1)  # softmax along q
 
         out = attention_scores @ v  # (B, num_heads, T, head_dim)
-        out = out.reshape(out.size(0), out.size(2), -1)
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.O(out)
 
@@ -68,9 +72,9 @@ class AttentionLayer(nn.Module):
 class MLPLayer(nn.Module):
     def __init__(self, model_dim: int, intermediate_dim: int):
         super().__init__()
-        self.l1 = nn.Linear(model_dim, intermediate_dim)
-        self.l2 = nn.Linear(model_dim, intermediate_dim)
-        self.l3 = nn.Linear(intermediate_dim, model_dim)
+        self.l1 = nn.Linear(model_dim, intermediate_dim, bias=False)
+        self.l2 = nn.Linear(model_dim, intermediate_dim, bias=False)
+        self.l3 = nn.Linear(intermediate_dim, model_dim, bias=False)
 
     def forward(self, x: torch.Tensor):
         gate = F.silu(self.l1(x))
