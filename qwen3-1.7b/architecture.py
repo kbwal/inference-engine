@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from load_weights import load_weights
+from run_tokenization import encode, decode
 
 
 class AttentionLayer(nn.Module):
@@ -184,7 +185,7 @@ class Qwen3Model(nn.Module):
         return x
 
 
-class Qwen3_4B(nn.Module):
+class Qwen3_1_7B(nn.Module):
     def __init__(
         self,
         model_dim: int,
@@ -194,7 +195,6 @@ class Qwen3_4B(nn.Module):
         num_kv_heads: int,
         vocab_size: int,
         num_layers: int,
-        tie_word_embeddings: bool = True,
         device: str = "mps",
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -210,10 +210,8 @@ class Qwen3_4B(nn.Module):
             device=device,
             dtype=dtype,
         )
-        self.lm_head = (
-            nn.Linear(model_dim, vocab_size, bias=False, device=device, dtype=dtype)
-            if not tie_word_embeddings
-            else None
+        self.lm_head = nn.Linear(
+            model_dim, vocab_size, bias=False, device=device, dtype=dtype
         )
 
     def forward(self, x: torch.Tensor):
@@ -226,14 +224,14 @@ class Qwen3_4B(nn.Module):
         return F.linear(x, w)
 
 
-model_dim = 2560
-mlp_intermediate_dim = 9728
+model_dim = 2048
+mlp_intermediate_dim = 6144
 head_dim = 128
-num_q_heads = 32
+num_q_heads = 16
 num_kv_heads = 8
 vocab_size = 151936
-num_layers = 36
-model = Qwen3_4B(
+num_layers = 28
+model = Qwen3_1_7B(
     model_dim=model_dim,
     mlp_intermediate_dim=mlp_intermediate_dim,
     head_dim=head_dim,
@@ -241,8 +239,15 @@ model = Qwen3_4B(
     num_kv_heads=num_kv_heads,
     vocab_size=vocab_size,
     num_layers=num_layers,
-    tie_word_embeddings=True,
     device="mps",
     dtype=torch.bfloat16,
 )
 model.load_state_dict(load_weights(device="cpu"))
+
+msgs = [
+    [{"role": "user", "content": "What's your name?"}],
+]
+token_ids, _ = encode(msgs)
+raw = model.forward(token_ids.to("mps"))
+output_token = torch.argmax(raw[0][-1])
+print(decode(output_token))

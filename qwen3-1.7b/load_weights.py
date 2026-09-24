@@ -7,7 +7,7 @@ def load_weights(
     model_path: str | None = None, device: str = "cpu"
 ) -> dict[str, torch.Tensor]:
     if model_path is None:
-        model_path = snapshot_download("Qwen/Qwen3-4B", local_files_only=True)
+        model_path = snapshot_download("Qwen/Qwen3-1.7B", local_files_only=True)
     shard_files = sorted(glob.glob(model_path + "/*.safetensors"))
     weights = {}
     for file in shard_files:
