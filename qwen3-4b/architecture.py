@@ -1,33 +1,49 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from load_weights import load_weights
 
 
 class AttentionLayer(nn.Module):
     def __init__(
-        self, model_dim: int, head_dim: int, num_q_heads: int, num_kv_heads: int
+        self,
+        model_dim: int,
+        head_dim: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        device: str = "mps",
+        dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         assert (
             num_q_heads % num_kv_heads == 0
         ), "make sure the num_q_heads is a multiple of num_kv_heads!"
-        self.o_proj = nn.Linear(num_q_heads * head_dim, model_dim, bias=False)
-        self.q_proj = nn.Linear(model_dim, num_q_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(model_dim, num_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(model_dim, num_kv_heads * head_dim, bias=False)
-        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6)
-        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
+        self.o_proj = nn.Linear(
+            num_q_heads * head_dim, model_dim, bias=False, device=device, dtype=dtype
+        )
+        self.q_proj = nn.Linear(
+            model_dim, num_q_heads * head_dim, bias=False, device=device, dtype=dtype
+        )
+        self.k_proj = nn.Linear(
+            model_dim, num_kv_heads * head_dim, bias=False, device=device, dtype=dtype
+        )
+        self.v_proj = nn.Linear(
+            model_dim, num_kv_heads * head_dim, bias=False, device=device, dtype=dtype
+        )
+        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6, device=device, dtype=dtype)
+        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6, device=device, dtype=dtype)
         self.head_dim = head_dim
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
 
     def rope(self, x: torch.Tensor, positions: torch.Tensor, base=1000000):
         assert self.head_dim % 2 == 0, "head_dim must be even for rope to work!"
-        inv_freq = base ** (-torch.arange(0, self.head_dim, 2) / self.head_dim)
+        inv_freq = base ** (
+            -torch.arange(0, self.head_dim, 2, device=x.device, dtype=torch.float32)
+            / self.head_dim
+        )
         angles = positions[:, None] * inv_freq[None, :]
-        cos, sin = angles.cos(), angles.sin()
+        cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
 
         x1, x2 = x[..., : self.head_dim // 2], x[..., self.head_dim // 2 :]
         out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
@@ -54,28 +70,34 @@ class AttentionLayer(nn.Module):
             dim=1,
         )
 
-        pos = torch.arange(q.size(-2))
+        pos = torch.arange(q.size(-2), device=q.device)
         q = self.rope(self.q_norm(q), pos)
         k = self.rope(self.k_norm(k), pos)
 
-        attention_scores = q @ k.transpose(-1, -2)  # (B, num_heads, T, T)
-        mask = torch.tril(torch.ones(attention_scores.shape))
-        attention_scores = attention_scores.masked_fill(mask == 0, float("-inf"))
-        attention_scores /= math.sqrt(self.head_dim)
-        attention_scores = attention_scores.softmax(dim=-1)  # softmax along q
-
-        out = attention_scores @ v  # (B, num_heads, T, head_dim)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.o_proj(out)
 
 
 class MLPLayer(nn.Module):
-    def __init__(self, model_dim: int, intermediate_dim: int):
+    def __init__(
+        self,
+        model_dim: int,
+        intermediate_dim: int,
+        device: str = "mps",
+        dtype: torch.dtype = torch.bfloat16,
+    ):
         super().__init__()
-        self.gate_proj = nn.Linear(model_dim, intermediate_dim, bias=False)
-        self.up_proj = nn.Linear(model_dim, intermediate_dim, bias=False)
-        self.down_proj = nn.Linear(intermediate_dim, model_dim, bias=False)
+        self.gate_proj = nn.Linear(
+            model_dim, intermediate_dim, bias=False, device=device, dtype=dtype
+        )
+        self.up_proj = nn.Linear(
+            model_dim, intermediate_dim, bias=False, device=device, dtype=dtype
+        )
+        self.down_proj = nn.Linear(
+            intermediate_dim, model_dim, bias=False, device=device, dtype=dtype
+        )
 
     def forward(self, x: torch.Tensor):
         gate = F.silu(self.gate_proj(x))
@@ -91,6 +113,8 @@ class TransformerBlock(nn.Module):
         head_dim: int,
         num_q_heads: int,
         num_kv_heads: int,
+        device: str = "mps",
+        dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.self_attn = AttentionLayer(
@@ -98,10 +122,21 @@ class TransformerBlock(nn.Module):
             head_dim=head_dim,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
+            device=device,
+            dtype=dtype,
         )
-        self.input_layernorm = nn.RMSNorm(model_dim, eps=1e-6)
-        self.mlp = MLPLayer(model_dim=model_dim, intermediate_dim=mlp_intermediate_dim)
-        self.post_attention_layernorm = nn.RMSNorm(model_dim, eps=1e-6)
+        self.input_layernorm = nn.RMSNorm(
+            model_dim, eps=1e-6, device=device, dtype=dtype
+        )
+        self.mlp = MLPLayer(
+            model_dim=model_dim,
+            intermediate_dim=mlp_intermediate_dim,
+            device=device,
+            dtype=dtype,
+        )
+        self.post_attention_layernorm = nn.RMSNorm(
+            model_dim, eps=1e-6, device=device, dtype=dtype
+        )
 
     def forward(self, x: torch.Tensor):
         x = x + self.self_attn(self.input_layernorm(x))
@@ -119,17 +154,27 @@ class Qwen3Model(nn.Module):
         num_kv_heads: int,
         vocab_size: int,
         num_layers: int,
+        device: str = "mps",
+        dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
-        self.embed_tokens = nn.Embedding(vocab_size, model_dim)
+        self.embed_tokens = nn.Embedding(
+            vocab_size, model_dim, device=device, dtype=dtype
+        )
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
             self.layers.append(
                 TransformerBlock(
-                    model_dim, mlp_intermediate_dim, head_dim, num_q_heads, num_kv_heads
+                    model_dim,
+                    mlp_intermediate_dim,
+                    head_dim,
+                    num_q_heads,
+                    num_kv_heads,
+                    device=device,
+                    dtype=dtype,
                 )
             )
-        self.norm = nn.RMSNorm(model_dim, eps=1e-6)
+        self.norm = nn.RMSNorm(model_dim, eps=1e-6, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor):
         x = self.embed_tokens(x)
@@ -140,7 +185,6 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3_4B(nn.Module):
-
     def __init__(
         self,
         model_dim: int,
@@ -151,6 +195,8 @@ class Qwen3_4B(nn.Module):
         vocab_size: int,
         num_layers: int,
         tie_word_embeddings: bool = True,
+        device: str = "mps",
+        dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.model = Qwen3Model(
@@ -161,9 +207,11 @@ class Qwen3_4B(nn.Module):
             num_kv_heads=num_kv_heads,
             vocab_size=vocab_size,
             num_layers=num_layers,
+            device=device,
+            dtype=dtype,
         )
         self.lm_head = (
-            nn.Linear(model_dim, vocab_size, bias=False)
+            nn.Linear(model_dim, vocab_size, bias=False, device=device, dtype=dtype)
             if not tie_word_embeddings
             else None
         )
@@ -194,5 +242,7 @@ model = Qwen3_4B(
     vocab_size=vocab_size,
     num_layers=num_layers,
     tie_word_embeddings=True,
+    device="mps",
+    dtype=torch.bfloat16,
 )
-model.load_state_dict(load_weights())
+model.load_state_dict(load_weights(device="cpu"))
