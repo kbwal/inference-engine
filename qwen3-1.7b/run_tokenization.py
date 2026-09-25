@@ -2,8 +2,12 @@ from transformers import AutoTokenizer, Qwen2Tokenizer
 import torch
 
 # the type for qwen3-4b's tokenizer is Qwen2Tokenizer. i assume they didn't change the tokenizer!
-tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
-tokenizer.padding_side = "left"
+def gen_tokenizer(): 
+    tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+    tokenizer.padding_side = "left"
+    return tokenizer
+
+tokenizer = gen_tokenizer()
 
 def encode(msgs: list[list[dict[str, str]]]) -> tuple[torch.Tensor, torch.Tensor]:
     assert all(

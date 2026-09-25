@@ -13,12 +13,12 @@ def _raw_output_dist(model, inputs: list[str])->torch.Tensor:
     raw = model.forward(token_ids.to("mps"), attention_mask=attention_mask.to("mps"))
     return raw
 
-def greedy_batch_decode(model, inputs:list[str])->list[str]: 
+def batch_greedy_decode(model, inputs:list[str])->list[str]: 
     raw = _raw_output_dist(model, inputs)
     return decode(torch.argmax(raw,-1))
 
 @torch.inference_mode()
-def temperature_sampling(model, inputs: list[str],tau)->list[str]:
+def batch_temperature_sampling(model, inputs: list[str],tau)->list[str]:
     raw = _raw_output_dist(model, inputs)
     raw /= tau 
     dist = raw.softmax(-1, dtype= torch.bfloat16)
@@ -26,11 +26,10 @@ def temperature_sampling(model, inputs: list[str],tau)->list[str]:
     sampled_indices = sampled_indices.squeeze(-1)
     return decode(sampled_indices)
 
-
     
 if __name__=="__main__":
     model = make_qwen_1_7()
     model.load_state_dict(load_weights(device="cpu"))
-    print(greedy_batch_decode(model, ["3*2: "]))
-    print(temperature_sampling(model, ["adslf", "My name is "], 0.1))
+    print(batch_greedy_decode(model, ["3*2: "]))
+    print(batch_temperature_sampling(model, ["adslf", "My name is "], 0.9))
 
