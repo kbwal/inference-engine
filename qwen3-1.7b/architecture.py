@@ -49,7 +49,7 @@ class AttentionLayer(nn.Module):
         out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
         return out
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, attention_mask = None):
         B, T, _ = x.shape
         q: torch.Tensor = self.q_proj(x)
         k: torch.Tensor = self.k_proj(x)
@@ -73,8 +73,13 @@ class AttentionLayer(nn.Module):
         pos = torch.arange(q.size(-2), device=q.device)
         q = self.rope(self.q_norm(q), pos)
         k = self.rope(self.k_norm(k), pos)
-
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if attention_mask is None: 
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)   
+        else:
+            causal_mask = torch.ones(T,T,dtype=torch.bool, device = x.device).tril()
+            valid_keys = attention_mask[:,None,None,:].bool()
+            allowed = causal_mask[None,None,:,:] & valid_keys # shape [B,1,T,T]
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, is_causal=False) # attention shape is # [B,H,T,T] but the mask broadcasts over H
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.o_proj(out)
@@ -138,8 +143,8 @@ class TransformerBlock(nn.Module):
             model_dim, eps=1e-6, device=device, dtype=dtype
         )
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.self_attn(self.input_layernorm(x))
+    def forward(self, x: torch.Tensor, attention_mask = None):
+        x = x + self.self_attn(self.input_layernorm(x), attention_mask= attention_mask)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -176,10 +181,10 @@ class Qwen3Model(nn.Module):
             )
         self.norm = nn.RMSNorm(model_dim, eps=1e-6, device=device, dtype=dtype)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, attention_mask=None):
         x = self.embed_tokens(x)
         for block in self.layers:
-            x = block(x)
+            x = block(x, attention_mask=attention_mask)
         x = self.norm(x)
         return x
 
@@ -214,15 +219,15 @@ class Qwen3_1_7B(nn.Module):
             model_dim, vocab_size, bias=False, device=device, dtype=dtype
         )
 
-    def forward(self, x: torch.Tensor):
-        x = self.model(x)
+    def forward(self, x: torch.Tensor, attention_mask = None): # this returns only the final logits now
+        x = self.model(x, attention_mask)
         x = x[:,-1,:]
         w = (
             self.model.embed_tokens.weight
             if self.lm_head is None
             else self.lm_head.weight
         )
-        return F.linear(x, w).softmax(-1,dtype=self.dtype)
+        return F.linear(x, w)
 
 def make_qwen_1_7():
     model_dim = 2048
