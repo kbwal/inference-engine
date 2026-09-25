@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from load_weights import load_weights
 from run_tokenization import encode, decode
 
-
 class AttentionLayer(nn.Module):
     def __init__(
         self,
@@ -199,6 +198,7 @@ class Qwen3_1_7B(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
+        self.dtype = dtype
         self.model = Qwen3Model(
             model_dim=model_dim,
             mlp_intermediate_dim=mlp_intermediate_dim,
@@ -216,38 +216,43 @@ class Qwen3_1_7B(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = self.model(x)
+        x = x[:,-1,:]
         w = (
             self.model.embed_tokens.weight
             if self.lm_head is None
             else self.lm_head.weight
         )
-        return F.linear(x, w)
+        return F.linear(x, w).softmax(-1,dtype=self.dtype)
 
+def make_qwen_1_7():
+    model_dim = 2048
+    mlp_intermediate_dim = 6144
+    head_dim = 128
+    num_q_heads = 16
+    num_kv_heads = 8
+    vocab_size = 151936
+    num_layers = 28
+    model = Qwen3_1_7B(
+        model_dim=model_dim,
+        mlp_intermediate_dim=mlp_intermediate_dim,
+        head_dim=head_dim,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        vocab_size=vocab_size,
+        num_layers=num_layers,
+        device="mps",
+        dtype=torch.bfloat16,
+    )
+    return model 
 
-model_dim = 2048
-mlp_intermediate_dim = 6144
-head_dim = 128
-num_q_heads = 16
-num_kv_heads = 8
-vocab_size = 151936
-num_layers = 28
-model = Qwen3_1_7B(
-    model_dim=model_dim,
-    mlp_intermediate_dim=mlp_intermediate_dim,
-    head_dim=head_dim,
-    num_q_heads=num_q_heads,
-    num_kv_heads=num_kv_heads,
-    vocab_size=vocab_size,
-    num_layers=num_layers,
-    device="mps",
-    dtype=torch.bfloat16,
-)
-model.load_state_dict(load_weights(device="cpu"))
-
-msgs = [
-    [{"role": "user", "content": "What's your name?"}],
-]
-token_ids, _ = encode(msgs)
-raw = model.forward(token_ids.to("mps"))
-output_token = torch.argmax(raw[0][-1])
-print(decode(output_token))
+if __name__ == "__main__":
+    model = make_qwen_1_7()
+    model.load_state_dict(load_weights(device="cpu"))
+    print(model.state_dict)
+    msgs = [
+        [{"role": "user", "content": "My name is qwe"}],
+    ]
+    token_ids, _ = encode(msgs)
+    raw = model.forward(token_ids.to("mps"))
+    output_token = torch.argmax(raw[0])
+    print(decode(output_token))
