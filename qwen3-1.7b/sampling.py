@@ -33,10 +33,10 @@ def batch_temperature_sampling(
             model=model, token_ids=token_ids, attention_mask=attention_mask
         )
 
-    raw = model.forward(token_ids, attention_mask=attention_mask)
+    raw = model(token_ids, attention_mask=attention_mask)
     probs = (raw / tau).softmax(-1)
-    predicted_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-    full_ids = torch.cat((token_ids, predicted_tokens.unsqueeze(dim=1)), dim=1)
+    predicted_tokens = torch.multinomial(probs, num_samples=1)
+    full_ids = torch.cat((token_ids, predicted_tokens), dim=1)
     return (
         decode(predicted_tokens),
         predicted_tokens,
