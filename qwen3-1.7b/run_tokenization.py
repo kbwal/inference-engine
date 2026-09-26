@@ -32,5 +32,6 @@ def encode(
     return token_ids.to(device), mask.to(device)
 
 
-def decode(token_ids: torch.Tensor) -> list[str]:
+def decode(token_ids: torch.Tensor | list[torch.Tensor]) -> list[str]:
     return tokenizer.batch_decode(token_ids, skip_special_tokens=True)
+
