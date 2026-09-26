@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from load_weights import load_weights
-from run_tokenization import encode, decode
+
 
 class AttentionLayer(nn.Module):
     def __init__(
@@ -42,14 +41,14 @@ class AttentionLayer(nn.Module):
             -torch.arange(0, self.head_dim, 2, device=x.device, dtype=torch.float32)
             / self.head_dim
         )
-        angles = positions[:, None] * inv_freq[None, :]
+        angles = positions[:, None, :, None] * inv_freq[None, None, None, :]
         cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
 
         x1, x2 = x[..., : self.head_dim // 2], x[..., self.head_dim // 2 :]
         out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
         return out
 
-    def forward(self, x: torch.Tensor, attention_mask = None):
+    def forward(self, x: torch.Tensor, attention_mask=None):
         B, T, _ = x.shape
         q: torch.Tensor = self.q_proj(x)
         k: torch.Tensor = self.k_proj(x)
@@ -70,16 +69,22 @@ class AttentionLayer(nn.Module):
             dim=1,
         )
 
-        pos = torch.arange(q.size(-2), device=q.device)
+        if attention_mask is not None:
+            pos = attention_mask.long().cumsum(-1) - 1
+            pos = pos.masked_fill(attention_mask == 0, 0)
+        else:
+            pos = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
         q = self.rope(self.q_norm(q), pos)
         k = self.rope(self.k_norm(k), pos)
-        if attention_mask is None: 
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)   
+        if attention_mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            causal_mask = torch.ones(T,T,dtype=torch.bool, device = x.device).tril()
-            valid_keys = attention_mask[:,None,None,:].bool()
-            allowed = causal_mask[None,None,:,:] & valid_keys # shape [B,1,T,T]
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, is_causal=False) # attention shape is # [B,H,T,T] but the mask broadcasts over H
+            causal_mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
+            valid_keys = attention_mask[:, None, None, :].bool()
+            allowed = causal_mask[None, None, :, :] & valid_keys  # shape [B,1,T,T]
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=allowed, is_causal=False
+            )  # attention shape is # [B,H,T,T] but the mask broadcasts over H
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.o_proj(out)
@@ -143,8 +148,8 @@ class TransformerBlock(nn.Module):
             model_dim, eps=1e-6, device=device, dtype=dtype
         )
 
-    def forward(self, x: torch.Tensor, attention_mask = None):
-        x = x + self.self_attn(self.input_layernorm(x), attention_mask= attention_mask)
+    def forward(self, x: torch.Tensor, attention_mask=None):
+        x = x + self.self_attn(self.input_layernorm(x), attention_mask=attention_mask)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -182,6 +187,7 @@ class Qwen3Model(nn.Module):
         self.norm = nn.RMSNorm(model_dim, eps=1e-6, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor, attention_mask=None):
+        assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
         x = self.embed_tokens(x)
         for block in self.layers:
             x = block(x, attention_mask=attention_mask)
@@ -219,15 +225,24 @@ class Qwen3_1_7B(nn.Module):
             model_dim, vocab_size, bias=False, device=device, dtype=dtype
         )
 
-    def forward(self, x: torch.Tensor, attention_mask = None): # this returns only the final logits now
+    def forward(self, x: torch.Tensor, attention_mask=None):  # returns logits
+        assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
         x = self.model(x, attention_mask)
-        x = x[:,-1,:]
+        if attention_mask is not None:
+            B, T = attention_mask.shape
+            positions = torch.arange(T, device=attention_mask.device)
+            masked_positions = torch.where(attention_mask.bool(), positions, -1)
+            last_indices = masked_positions.argmax(dim=-1)
+            x = x[torch.arange(B, device=x.device), last_indices]
+        else:
+            x = x[:, -1, :]
         w = (
             self.model.embed_tokens.weight
             if self.lm_head is None
             else self.lm_head.weight
         )
         return F.linear(x, w)
+
 
 def make_qwen_1_7():
     model_dim = 2048
@@ -248,16 +263,4 @@ def make_qwen_1_7():
         device="mps",
         dtype=torch.bfloat16,
     )
-    return model 
-
-if __name__ == "__main__":
-    model = make_qwen_1_7()
-    model.load_state_dict(load_weights(device="cpu"))
-    print(model.state_dict)
-    msgs = [
-        [{"role": "user", "content": "My name is qwe"}],
-    ]
-    token_ids, _ = encode(msgs)
-    raw = model.forward(token_ids.to("mps"))
-    output_token = torch.argmax(raw[0])
-    print(decode(output_token))
+    return model
