@@ -12,7 +12,9 @@ def gen_tokenizer():
 tokenizer = gen_tokenizer()
 
 
-def encode(msgs: list[list[dict[str, str]]]) -> tuple[torch.Tensor, torch.Tensor]:
+def encode(
+    msgs: list[list[dict[str, str]]], device: str = "cpu"
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert all(
         list(msgs[0][i].keys()) == ["role", "content"] for i in range(len(msgs[0]))
     ), "make sure your messages have a 'role' and a 'content' field"
@@ -27,7 +29,7 @@ def encode(msgs: list[list[dict[str, str]]]) -> tuple[torch.Tensor, torch.Tensor
     # (B, seq_len)
     token_ids: torch.Tensor = formatted_prompt.input_ids  # type: ignore
     mask: torch.Tensor = formatted_prompt.attention_mask  # type: ignore
-    return token_ids, mask
+    return token_ids.to(device), mask.to(device)
 
 
 def decode(token_ids: torch.Tensor) -> list[str]:
