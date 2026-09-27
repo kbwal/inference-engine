@@ -1,6 +1,23 @@
 from architecture import Qwen3_1_7B
+import time
+from dataclasses import dataclass
 import torch
 from run_tokenization import encode, decode
+
+
+@dataclass
+class GenerationStats:
+    prompt_tokens: int  # non-pad
+    ttft_s: float  # time to first token
+    prefill_tok_s: float  # input_tokens / ttft_s
+    decode_steps: int  # max over all in batch, even if some are dropped
+    decode_s: float  # overall_time - ttft
+    decode_tok_s_per_seq: float  # decode_steps / decode_seconds
+    decode_tok_s_batch: float  # decode_tokens / decode_seconds
+
+
+def sync():
+    torch.mps.synchronize()
 
 
 @torch.inference_mode()
@@ -43,8 +60,10 @@ def autoregress(
     stop_token_id: int,
     device: str,
     drop_stopped: bool = True,
-) -> list[str]:
+) -> tuple[list[str], GenerationStats]:
     model = model.to(device)
+    sync()
+    t_start = time.perf_counter()
 
     msgs = []
     for input in inputs:
@@ -57,8 +76,12 @@ def autoregress(
     finished_sequences = torch.zeros((token_ids.shape[0], 1), device=device).bool()
     active_indices = torch.arange(B, device=device)
     outputs: list[torch.Tensor | None] = [None] * B
+    prompt_tokens = attention_mask.sum()
 
-    for _ in range(max_new_tokens):
+    t_first = t_start
+    num_steps = 0
+    decode_tokens = 0
+    for step in range(max_new_tokens):
         if token_ids.shape[0] == 0:
             break
 
@@ -91,7 +114,30 @@ def autoregress(
             finished_sequences = finished_sequences[keep]
             active_indices = active_indices[keep]
 
+        num_steps += 1
+        if step == 0:
+            sync()
+            t_first = time.perf_counter()
+        else:
+            decode_tokens += predicted_tokens.shape[0]
+
+    sync()
+    t_end = time.perf_counter()
+
     for idx in range(token_ids.shape[0]):
         outputs[int(active_indices[idx].item())] = token_ids[idx, prompt_len:]
 
-    return decode([out for out in outputs if out is not None])
+    n_prompt = int(prompt_tokens.item())
+    ttft_s = t_first - t_start
+    decode_s = t_end - t_first
+    decode_steps = max(num_steps - 1, 0)
+    stats = GenerationStats(
+        prompt_tokens=n_prompt,
+        ttft_s=ttft_s,
+        prefill_tok_s=n_prompt / ttft_s,
+        decode_steps=decode_steps,
+        decode_s=decode_s,
+        decode_tok_s_per_seq=decode_steps / decode_s if decode_steps else 0.0,
+        decode_tok_s_batch=decode_tokens / decode_s if decode_steps else 0.0,
+    )
+    return decode([out for out in outputs if out is not None]), stats

@@ -2,13 +2,12 @@ from sampling import autoregress
 from run_tokenization import gen_tokenizer
 from architecture import make_qwen_1_7
 from load_weights import load_weights
-import time
 
 if __name__ == "__main__":
-    model = make_qwen_1_7()
+    model = make_qwen_1_7(device="meta")
     stop_token_id = gen_tokenizer().eos_token_id
     assert type(stop_token_id) == int
-    model.load_state_dict(load_weights(device="cpu"))
+    model.load_state_dict(load_weights(device="mps"), assign=True)
 
     MAX_NEW_TOKENS = 64
     inputs = [
@@ -18,9 +17,7 @@ if __name__ == "__main__":
         "my name is colonel mustard. which game am i from? am i from a game at all? who do you think killed me.",
         "your reply to this message should be one word. do you like cats or dogs? one word.",
     ]
-    t1 = time.time()
-
-    res = autoregress(
+    res, stats = autoregress(
         model=model,
         inputs=inputs,
         tau=0.3,
@@ -29,4 +26,8 @@ if __name__ == "__main__":
         device="mps",
         drop_stopped=False,
     )
-    print(f"throughput: {MAX_NEW_TOKENS * len(inputs) / (time.time() - t1)} tok/s")
+    print(f"prompt tokens:     {stats.prompt_tokens}")
+    print(f"ttft:              {stats.ttft_s * 1000:.1f} ms")
+    print(f"prefill:           {stats.prefill_tok_s:.1f} tok/s")
+    print(f"decode (per seq):  {stats.decode_tok_s_per_seq:.2f} tok/s")
+    print(f"decode (batch):    {stats.decode_tok_s_batch:.2f} tok/s")

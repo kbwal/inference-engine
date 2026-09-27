@@ -244,7 +244,7 @@ class Qwen3_1_7B(nn.Module):
         return F.linear(x, w)
 
 
-def make_qwen_1_7():
+def make_qwen_1_7(device: str = "mps", dtype: torch.dtype = torch.bfloat16):
     model_dim = 2048
     mlp_intermediate_dim = 6144
     head_dim = 128
@@ -260,7 +260,7 @@ def make_qwen_1_7():
         num_kv_heads=num_kv_heads,
         vocab_size=vocab_size,
         num_layers=num_layers,
-        device="mps",
-        dtype=torch.bfloat16,
+        device=device,
+        dtype=dtype,
     )
     return model
