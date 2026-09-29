@@ -35,15 +35,7 @@ class AttentionLayer(nn.Module):
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
 
-    def rope(self, x: torch.Tensor, positions: torch.Tensor, base=1000000):
-        assert self.head_dim % 2 == 0, "head_dim must be even for rope to work!"
-        inv_freq = base ** (
-            -torch.arange(0, self.head_dim, 2, device=x.device, dtype=torch.float32)
-            / self.head_dim
-        )
-        angles = positions[:, None, :, None] * inv_freq[None, None, None, :]
-        cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
-
+    def rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         x1, x2 = x[..., : self.head_dim // 2], x[..., self.head_dim // 2 :]
         out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
         return out
@@ -63,11 +55,12 @@ class AttentionLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        mask: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         B, T, _ = x.shape  # note: x is newly generated tokens NOT in the kv cache
-        cache_size = kv_cache[0].size(2) if kv_cache else 0
         q: torch.Tensor = self.q_proj(x)
         k: torch.Tensor = self.k_proj(x)
         v: torch.Tensor = self.v_proj(x)
@@ -76,18 +69,8 @@ class AttentionLayer(nn.Module):
         k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        if attention_mask is not None:
-            pos = attention_mask.long().cumsum(-1) - 1
-            pos = pos.masked_fill(attention_mask == 0, 0)[:, cache_size:]
-        else:
-            pos = (
-                torch.arange(cache_size, cache_size + T, device=x.device)
-                .unsqueeze(0)
-                .expand(B, T)
-            )
-
-        q = self.rope(self.q_norm(q), pos)
-        k = self.rope(self.k_norm(k), pos)
+        q = self.rope(self.q_norm(q), cos=cos, sin=sin)
+        k = self.rope(self.k_norm(k), cos=cos, sin=sin)
 
         new_kv = self.update_kv(kv_cache, k, v)
 
@@ -102,23 +85,7 @@ class AttentionLayer(nn.Module):
             dim=1,
         )
 
-        if attention_mask is None:
-            mask = torch.tril(
-                torch.ones(T, T + cache_size, device=q.device),
-                diagonal=cache_size,
-            ).bool()
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, is_causal=False
-            )
-        else:
-            causal_mask = torch.ones(
-                T, T + cache_size, dtype=torch.bool, device=x.device
-            ).tril(diagonal=cache_size)
-            valid_keys = attention_mask[:, None, None, :].bool()
-            allowed = causal_mask[None, None, :, :] & valid_keys  # [B,1,T,T]
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=allowed, is_causal=False
-            )  # attention shape is [B,H,T,T] but the mask broadcasts over H
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.o_proj(out), new_kv
@@ -186,11 +153,17 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        mask: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         attention_output, new_kv = self.self_attn(
-            self.input_layernorm(x), attention_mask=attention_mask, kv_cache=kv_cache
+            self.input_layernorm(x),
+            cos=cos,
+            sin=sin,
+            mask=mask,
+            kv_cache=kv_cache,
         )
         x = x + attention_output
         x = x + self.mlp(self.post_attention_layernorm(x))
@@ -207,6 +180,7 @@ class Qwen3Model(nn.Module):
         num_kv_heads: int,
         vocab_size: int,
         num_layers: int,
+        base: int = 1000000,
         device: str = "mps",
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -228,6 +202,11 @@ class Qwen3Model(nn.Module):
                 )
             )
         self.norm = nn.RMSNorm(model_dim, eps=1e-6, device=device, dtype=dtype)
+        self.register_buffer(
+            "inv_freq",
+            base ** (-torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim),
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -236,15 +215,43 @@ class Qwen3Model(nn.Module):
         kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ):
         assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
-        cache_len = kv_cache[0][0].size(2) if kv_cache is not None else 0
+        cache_size = kv_cache[0][0].size(2) if kv_cache is not None else 0
         x = self.embed_tokens(
-            x[:, cache_len:]
+            x[:, cache_size:]
         )  # everything in cache is sliced out during forward
+        B, T, _ = x.shape
+
+        if attention_mask is not None:
+            pos = attention_mask.long().cumsum(-1) - 1
+            pos = pos.masked_fill(attention_mask == 0, 0)[:, cache_size:]
+            causal_mask = torch.ones(
+                T, T + cache_size, dtype=torch.bool, device=x.device
+            ).tril(diagonal=cache_size)
+            valid_keys = attention_mask[:, None, None, :].bool()
+            mask = causal_mask[None, None, :, :] & valid_keys  # [B,1,T,T]
+        else:
+            pos = (
+                torch.arange(cache_size, cache_size + T, device=x.device)
+                .unsqueeze(0)
+                .expand(B, T)
+            )
+            mask = torch.tril(
+                torch.ones(T, T + cache_size, device=x.device),
+                diagonal=cache_size,
+            ).bool()
+
+        angles = (
+            pos[:, None, :, None] * self.get_buffer("inv_freq")[None, None, None, :]
+        )
+        cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+
         new_cache = []
         for i, block in enumerate(self.layers):
             x, layer_kv = block(
                 x,
-                attention_mask=attention_mask,
+                cos=cos,
+                sin=sin,
+                mask=mask,
                 kv_cache=kv_cache[i] if kv_cache is not None else None,
             )
             new_cache.append(layer_kv)
