@@ -10,6 +10,7 @@ class AttentionLayer(nn.Module):
         head_dim: int,
         num_q_heads: int,
         num_kv_heads: int,
+        attention_multiplier: float = 0.015625,
         device: str = "mps",
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -29,11 +30,10 @@ class AttentionLayer(nn.Module):
         self.v_proj = nn.Linear(
             model_dim, num_kv_heads * head_dim, bias=False, device=device, dtype=dtype
         )
-        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6, device=device, dtype=dtype)
-        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6, device=device, dtype=dtype)
         self.head_dim = head_dim
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
+        self.attention_multiplier = attention_multiplier
 
     def rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         x1, x2 = x[..., : self.head_dim // 2], x[..., self.head_dim // 2 :]
@@ -69,8 +69,8 @@ class AttentionLayer(nn.Module):
         k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        q = self.rope(self.q_norm(q), cos=cos, sin=sin)
-        k = self.rope(self.k_norm(k), cos=cos, sin=sin)
+        q = self.rope(q, cos=cos, sin=sin)
+        k = self.rope(k, cos=cos, sin=sin)
 
         new_kv = self.update_kv(kv_cache, k, v)
 
@@ -85,10 +85,28 @@ class AttentionLayer(nn.Module):
             dim=1,
         )
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, is_causal=False, scale=self.attention_multiplier
+        )  # granite replaces the usual 1/sqrt(head_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.o_proj(out), new_kv
+
+
+class MOEParallelExperts(nn.Module):
+    def __init__(self, num_experts, in_dim, out_dim, device, dtype):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.empty(num_experts, out_dim, in_dim, device=device, dtype=dtype)
+        )
+
+
+class MOERouter(nn.Module):
+    def __init__(self, model_dim, num_experts, device, dtype):
+        super().__init__()
+        self.layer = nn.Linear(
+            model_dim, num_experts, bias=False, device=device, dtype=dtype
+        )
 
 
 class MLPLayer(nn.Module):
@@ -96,25 +114,40 @@ class MLPLayer(nn.Module):
         self,
         model_dim: int,
         intermediate_dim: int,
+        num_experts: int,
+        num_active_experts: int,
         device: str = "mps",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
-        self.gate_proj = nn.Linear(
-            model_dim, intermediate_dim, bias=False, device=device, dtype=dtype
+        self.num_active_experts = num_active_experts
+        self.num_experts = num_experts
+        self.router = MOERouter(model_dim, num_experts, device, dtype)
+        self.input_linear = MOEParallelExperts(
+            num_experts, model_dim, 2 * intermediate_dim, device, dtype
         )
-        self.up_proj = nn.Linear(
-            model_dim, intermediate_dim, bias=False, device=device, dtype=dtype
-        )
-        self.down_proj = nn.Linear(
-            intermediate_dim, model_dim, bias=False, device=device, dtype=dtype
+        self.output_linear = MOEParallelExperts(
+            num_experts, intermediate_dim, model_dim, device, dtype
         )
 
     def forward(self, x: torch.Tensor):
         # x does not include tokens in kv cache
-        gate = F.silu(self.gate_proj(x))
-        data = self.up_proj(x)
-        return self.down_proj(gate * data)
+        B, T, D = x.shape
+        x = x.reshape(-1, D)  # [N, D]
+        vals, idx = self.router.layer(x).topk(self.num_active_experts, dim=-1)
+        expert_weights = vals.softmax(dim=-1).to(x.dtype)
+
+        gates = torch.zeros(B * T, self.num_experts, device=x.device, dtype=x.dtype)
+        gates = gates.scatter(
+            1, idx, expert_weights
+        )  # scatter expert weights into [N, num_experts], has num_active_experts non-zero per row
+        gate, up = (x @ self.input_linear.weight.transpose(-1, -2)).chunk(
+            2, dim=-1
+        )  # [N, D] @ [num_experts, D, 2*intermediate_dim] -> [num_experts, N, 2*intermediate_dim] -> chunk
+        y = (F.silu(gate) * up) @ self.output_linear.weight.transpose(
+            -1, -2
+        )  # [num_experts, N, D]
+        return (y * gates.transpose(-1, -2).unsqueeze(-1)).sum(dim=0).view(B, T, D)
 
 
 class TransformerBlock(nn.Module):
@@ -125,24 +158,32 @@ class TransformerBlock(nn.Module):
         head_dim: int,
         num_q_heads: int,
         num_kv_heads: int,
+        num_experts: int,
+        num_active_experts: int,
+        attention_multiplier: float = 0.015625,
+        residual_multiplier: float = 0.22,
         device: str = "mps",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
+        self.residual_multiplier = residual_multiplier
         self.self_attn = AttentionLayer(
             model_dim=model_dim,
             head_dim=head_dim,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
+            attention_multiplier=attention_multiplier,
             device=device,
             dtype=dtype,
         )
         self.input_layernorm = nn.RMSNorm(
             model_dim, eps=1e-6, device=device, dtype=dtype
         )
-        self.mlp = MLPLayer(
+        self.block_sparse_moe = MLPLayer(
             model_dim=model_dim,
             intermediate_dim=mlp_intermediate_dim,
+            num_experts=num_experts,
+            num_active_experts=num_active_experts,
             device=device,
             dtype=dtype,
         )
@@ -165,12 +206,16 @@ class TransformerBlock(nn.Module):
             mask=mask,
             kv_cache=kv_cache,
         )
-        x = x + attention_output
-        x = x + self.mlp(self.post_attention_layernorm(x))
+        x = x + attention_output * self.residual_multiplier
+        x = (
+            x
+            + self.block_sparse_moe(self.post_attention_layernorm(x))
+            * self.residual_multiplier
+        )
         return x, new_kv
 
 
-class Qwen3Model(nn.Module):
+class Granite3_1Model(nn.Module):
     def __init__(
         self,
         model_dim: int,
@@ -180,11 +225,17 @@ class Qwen3Model(nn.Module):
         num_kv_heads: int,
         vocab_size: int,
         num_layers: int,
-        base: int = 1000000,
+        num_experts: int,
+        num_active_experts: int,
+        base: int = 1500000,
+        embedding_multiplier: float = 12.0,
+        attention_multiplier: float = 0.015625,
+        residual_multiplier: float = 0.22,
         device: str = "mps",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
+        self.embedding_multiplier = embedding_multiplier
         self.embed_tokens = nn.Embedding(
             vocab_size, model_dim, device=device, dtype=dtype
         )
@@ -197,6 +248,10 @@ class Qwen3Model(nn.Module):
                     head_dim,
                     num_q_heads,
                     num_kv_heads,
+                    num_experts,
+                    num_active_experts,
+                    attention_multiplier=attention_multiplier,
+                    residual_multiplier=residual_multiplier,
                     device=device,
                     dtype=dtype,
                 )
@@ -223,8 +278,8 @@ class Qwen3Model(nn.Module):
     ):
         assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
         cache_size = kv_cache[0][0].size(2) if kv_cache is not None else 0
-        x = self.embed_tokens(
-            x[:, cache_size:]
+        x = (
+            self.embed_tokens(x[:, cache_size:]) * self.embedding_multiplier
         )  # everything in cache is sliced out during forward
         B, T, _ = x.shape
 
@@ -266,7 +321,7 @@ class Qwen3Model(nn.Module):
         return x, new_cache
 
 
-class Qwen3_1_7B(nn.Module):
+class Granite3_1_1B_400M(nn.Module):
     def __init__(
         self,
         model_dim: int,
@@ -276,12 +331,19 @@ class Qwen3_1_7B(nn.Module):
         num_kv_heads: int,
         vocab_size: int,
         num_layers: int,
+        num_experts: int,
+        num_active_experts: int,
+        embedding_multiplier: float = 12.0,
+        attention_multiplier: float = 0.015625,
+        residual_multiplier: float = 0.22,
+        logits_scaling: float = 6.0,
         device: str = "mps",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.dtype = dtype
-        self.model = Qwen3Model(
+        self.logits_scaling = logits_scaling
+        self.model = Granite3_1Model(
             model_dim=model_dim,
             mlp_intermediate_dim=mlp_intermediate_dim,
             head_dim=head_dim,
@@ -289,11 +351,13 @@ class Qwen3_1_7B(nn.Module):
             num_kv_heads=num_kv_heads,
             vocab_size=vocab_size,
             num_layers=num_layers,
+            num_experts=num_experts,
+            num_active_experts=num_active_experts,
+            embedding_multiplier=embedding_multiplier,
+            attention_multiplier=attention_multiplier,
+            residual_multiplier=residual_multiplier,
             device=device,
             dtype=dtype,
-        )
-        self.lm_head = nn.Linear(
-            model_dim, vocab_size, bias=False, device=device, dtype=dtype
         )
 
     def forward(
@@ -305,23 +369,25 @@ class Qwen3_1_7B(nn.Module):
         assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
         x, new_cache = self.model(x, attention_mask=attention_mask, kv_cache=kv_cache)
         x = x[:, -1, :]
-        w = (
-            self.model.embed_tokens.weight
-            if self.lm_head is None
-            else self.lm_head.weight
-        )
-        return F.linear(x, w), new_cache
+        w = self.model.embed_tokens.weight
+        return F.linear(x, w) / self.logits_scaling, new_cache
 
 
-def make_qwen_1_7(device: str = "mps", dtype: torch.dtype = torch.bfloat16):
-    model_dim = 2048
-    mlp_intermediate_dim = 6144
-    head_dim = 128
+def make_granite_1b_400m(device: str = "mps", dtype: torch.dtype = torch.bfloat16):
+    model_dim = 1024
+    mlp_intermediate_dim = 512
+    head_dim = 64  # hidden_size / num_heads; config has no explicit head_dim
     num_q_heads = 16
     num_kv_heads = 8
-    vocab_size = 151936
-    num_layers = 28
-    model = Qwen3_1_7B(
+    vocab_size = 49152
+    num_layers = 24
+    num_experts = 32
+    num_active_experts = 8
+    embedding_multiplier = 12.0
+    attention_multiplier = 0.015625
+    residual_multiplier = 0.22
+    logits_scaling = 6.0
+    model = Granite3_1_1B_400M(
         model_dim=model_dim,
         mlp_intermediate_dim=mlp_intermediate_dim,
         head_dim=head_dim,
@@ -329,6 +395,12 @@ def make_qwen_1_7(device: str = "mps", dtype: torch.dtype = torch.bfloat16):
         num_kv_heads=num_kv_heads,
         vocab_size=vocab_size,
         num_layers=num_layers,
+        num_experts=num_experts,
+        num_active_experts=num_active_experts,
+        embedding_multiplier=embedding_multiplier,
+        attention_multiplier=attention_multiplier,
+        residual_multiplier=residual_multiplier,
+        logits_scaling=logits_scaling,
         device=device,
         dtype=dtype,
     )

@@ -1,12 +1,12 @@
 from sampling import autoregress
-from run_tokenization import gen_tokenizer
-from architecture import make_qwen_1_7
+from transformers import AutoTokenizer
+from architecture import make_granite_1b_400m
 from load_weights import load_weights
 
 if __name__ == "__main__":
-    model = make_qwen_1_7(device="meta")
-    stop_token_id = gen_tokenizer().eos_token_id
-    assert type(stop_token_id) == int
+    model = make_granite_1b_400m(device="meta")
+    tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-3.1-1b-a400m-base")
+    assert type(tokenizer.eos_token_id) == int
     model.load_state_dict(load_weights(device="mps"), assign=True)
 
     MAX_NEW_TOKENS = 64
@@ -19,10 +19,11 @@ if __name__ == "__main__":
     ]
     res, stats = autoregress(
         model=model,
+        tokenizer=tokenizer,
         inputs=inputs,
         tau=0.3,
         max_new_tokens=MAX_NEW_TOKENS,
-        stop_token_id=stop_token_id,
+        stop_token_id=tokenizer.eos_token_id,
         device="mps",
         drop_stopped=False,
     )
