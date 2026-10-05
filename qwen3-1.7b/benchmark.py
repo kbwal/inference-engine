@@ -9,26 +9,46 @@ if __name__ == "__main__":
     assert type(stop_token_id) == int
     model.load_state_dict(load_weights(device="cuda"), assign=True)
 
-    MAX_NEW_TOKENS = 64
-    inputs = [
+    MAX_NEW_TOKENS = 128
+    BATCH_SIZES = [1, 4, 16, 64]
+    prompts = [
         "how does the light dependent reaction work?",
         "write me a binary search in cpp.",
         "what is euclid's infinite primes proof?",
         "my name is colonel mustard. which game am i from? am i from a game at all? who do you think killed me.",
         "your reply to this message should be one word. do you like cats or dogs? one word.",
     ]
-    res, stats = autoregress(
-        model=model,
-        inputs=inputs,
-        tau=0.3,
-        max_new_tokens=MAX_NEW_TOKENS,
-        stop_token_id=stop_token_id,
-        device="cuda",
-        drop_stopped=False,
+
+    print(
+        f"{'batch':>5} | {'prompt tok':>10} | {'ttft (ms)':>9} | {'prefill tok/s':>13} | "
+        f"{'decode tok/s/seq':>16} | {'decode tok/s total':>18}"
     )
-    print("result: ", res)
-    print(f"prompt tokens:     {stats.prompt_tokens}")
-    print(f"ttft:              {stats.ttft_s * 1000:.1f} ms")
-    print(f"prefill:           {stats.prefill_tok_s:.1f} tok/s")
-    print(f"decode (per seq):  {stats.decode_tok_s_per_seq:.2f} tok/s")
-    print(f"decode (batch):    {stats.decode_tok_s_batch:.2f} tok/s")
+    for batch_size in BATCH_SIZES:
+        inputs = [prompts[i % len(prompts)] for i in range(batch_size)]
+        # dummy call per batch size so cuda init / cublas kernel selection for
+        # these shapes doesn't pollute ttft
+        autoregress(
+            model=model,
+            inputs=inputs,
+            tau=0.3,
+            max_new_tokens=8,
+            stop_token_id=stop_token_id,
+            device="cuda",
+            drop_stopped=False,
+        )
+        res, stats = autoregress(
+            model=model,
+            inputs=inputs,
+            tau=0.3,
+            max_new_tokens=MAX_NEW_TOKENS,
+            stop_token_id=stop_token_id,
+            device="cuda",
+            drop_stopped=False,
+        )
+        print(
+            f"{batch_size:>5} | {stats.prompt_tokens:>10} | {stats.ttft_s * 1000:>9.1f} | "
+            f"{stats.prefill_tok_s:>13.1f} | {stats.decode_tok_s_per_seq:>16.2f} | "
+            f"{stats.decode_tok_s_batch:>18.2f}"
+        )
+
+    print("\nsample output (last batch, first seq):", repr(res[0]))  # type: ignore
