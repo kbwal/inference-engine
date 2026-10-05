@@ -42,15 +42,14 @@ class AttentionLayer(nn.Module):
 
     def update_kv(
         self,
-        past_kv: tuple[torch.Tensor, torch.Tensor] | None,
+        past_kv: tuple[torch.Tensor, torch.Tensor],
+        cache_size: int,
         new_k: torch.Tensor,
         new_v: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if past_kv is None:
-            return (new_k, new_v)
-        combined_k = torch.cat((past_kv[0], new_k), dim=2)
-        combined_v = torch.cat((past_kv[1], new_v), dim=2)
-        return (combined_k, combined_v)
+    ) -> None:
+        T = new_k.size(2)
+        past_kv[0][:, :, cache_size : cache_size + T] = new_k
+        past_kv[1][:, :, cache_size : cache_size + T] = new_v
 
     def forward(
         self,
@@ -58,7 +57,8 @@ class AttentionLayer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        cache_size: int,
     ):
         B, T, _ = x.shape  # note: x is newly generated tokens NOT in the kv cache
         q: torch.Tensor = self.q_proj(x)
@@ -72,25 +72,23 @@ class AttentionLayer(nn.Module):
         q = self.rope(q, cos=cos, sin=sin)
         k = self.rope(k, cos=cos, sin=sin)
 
-        new_kv = self.update_kv(kv_cache, k, v)
+        self.update_kv(kv_cache, cache_size, k, v)
 
-        k = torch.repeat_interleave(
-            new_kv[0],
-            self.num_q_heads // self.num_kv_heads,
-            dim=1,
-        )
-        v = torch.repeat_interleave(
-            new_kv[1],
-            self.num_q_heads // self.num_kv_heads,
-            dim=1,
-        )
+        k = kv_cache[0][:, :, : cache_size + T]
+        v = kv_cache[1][:, :, : cache_size + T]
 
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=False, scale=self.attention_multiplier
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            is_causal=False,
+            scale=self.attention_multiplier,
+            enable_gqa=True,
         )  # granite replaces the usual 1/sqrt(head_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
-        return self.o_proj(out), new_kv
+        return self.o_proj(out)
 
 
 class MOEParallelExperts(nn.Module):
@@ -197,22 +195,27 @@ class TransformerBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        cache_size: int,
     ):
-        attention_output, new_kv = self.self_attn(
-            self.input_layernorm(x),
-            cos=cos,
-            sin=sin,
-            mask=mask,
-            kv_cache=kv_cache,
+        x = (
+            x
+            + self.self_attn(
+                self.input_layernorm(x),
+                cos=cos,
+                sin=sin,
+                mask=mask,
+                kv_cache=kv_cache,
+                cache_size=cache_size,
+            )
+            * self.residual_multiplier
         )
-        x = x + attention_output * self.residual_multiplier
         x = (
             x
             + self.block_sparse_moe(self.post_attention_layernorm(x))
             * self.residual_multiplier
         )
-        return x, new_kv
+        return x
 
 
 class Granite3_1Model(nn.Module):
@@ -273,11 +276,11 @@ class Granite3_1Model(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        cache_size: int,
         attention_mask: torch.Tensor | None = None,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ):
         assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
-        cache_size = kv_cache[0][0].size(2) if kv_cache is not None else 0
         x = (
             self.embed_tokens(x[:, cache_size:]) * self.embedding_multiplier
         )  # everything in cache is sliced out during forward
@@ -307,18 +310,17 @@ class Granite3_1Model(nn.Module):
         )
         cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
 
-        new_cache = []
         for i, block in enumerate(self.layers):
-            x, layer_kv = block(
+            x = block(
                 x,
                 cos=cos,
                 sin=sin,
                 mask=mask,
                 kv_cache=kv_cache[i] if kv_cache is not None else None,
+                cache_size=cache_size,
             )
-            new_cache.append(layer_kv)
         x = self.norm(x)
-        return x, new_cache
+        return x
 
 
 class Granite3_1_1B_400M(nn.Module):
@@ -363,14 +365,17 @@ class Granite3_1_1B_400M(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        cache_size: int,
         attention_mask: torch.Tensor | None = None,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ):  # returns logits
         assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
-        x, new_cache = self.model(x, attention_mask=attention_mask, kv_cache=kv_cache)
+        x = self.model(
+            x, attention_mask=attention_mask, kv_cache=kv_cache, cache_size=cache_size
+        )
         x = x[:, -1, :]
         w = self.model.embed_tokens.weight
-        return F.linear(x, w) / self.logits_scaling, new_cache
+        return F.linear(x, w) / self.logits_scaling
 
 
 def make_granite_1b_400m(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):

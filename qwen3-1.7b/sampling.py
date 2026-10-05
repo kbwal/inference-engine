@@ -1,4 +1,4 @@
-from architecture import Qwen3_1_7B
+from architecture import Qwen3_1_7B, AttentionLayer
 import time
 from dataclasses import dataclass
 import torch
@@ -24,14 +24,18 @@ def sync():
 def batch_greedy_decode(
     model: Qwen3_1_7B,
     token_ids: torch.Tensor,
+    kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+    cache_size: int,
     attention_mask: torch.Tensor | None = None,
-    kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-    raw, new_kv_cache = model.forward(
-        token_ids, attention_mask=attention_mask, kv_cache=kv_cache
+) -> torch.Tensor:
+    raw = model.forward(
+        token_ids,
+        attention_mask=attention_mask,
+        kv_cache=kv_cache,
+        cache_size=cache_size,
     )
     predicted_tokens = torch.argmax(raw, -1, keepdim=True)
-    return predicted_tokens, new_kv_cache
+    return predicted_tokens
 
 
 @torch.inference_mode()
@@ -39,25 +43,30 @@ def batch_temperature_sampling(
     model: Qwen3_1_7B,
     token_ids: torch.Tensor,
     tau: float,
+    kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+    cache_size: int,
     attention_mask: torch.Tensor | None = None,
-    kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+) -> torch.Tensor:
     assert tau >= 0.0, "make sure temperature is positive!"
 
     if tau == 0.0:
         return batch_greedy_decode(
             model=model,
             token_ids=token_ids,
-            attention_mask=attention_mask,
             kv_cache=kv_cache,
+            cache_size=cache_size,
+            attention_mask=attention_mask,
         )
 
-    raw, new_kv_cache = model(
-        token_ids, attention_mask=attention_mask, kv_cache=kv_cache
+    raw = model(
+        token_ids,
+        attention_mask=attention_mask,
+        kv_cache=kv_cache,
+        cache_size=cache_size,
     )
     probs = (raw / tau).softmax(-1)
     predicted_tokens = torch.multinomial(probs, num_samples=1)
-    return predicted_tokens, new_kv_cache
+    return predicted_tokens
 
 
 @torch.inference_mode()
@@ -69,7 +78,6 @@ def autoregress(
     stop_token_id: int,
     device: str,
     drop_stopped: bool = True,
-    use_kv_cache: bool = True,
 ) -> tuple[list[str], GenerationStats]:
     model = model.to(device)
     sync()
@@ -91,19 +99,44 @@ def autoregress(
     t_first = t_start
     num_steps = 0
     decode_tokens = 0
-    kv_cache = None
+
+    max_len = prompt_len + max_new_tokens
+    attn: AttentionLayer = model.model.layers[0].self_attn  # type: ignore
+    kv_cache = [
+        (
+            torch.empty(
+                B,
+                attn.num_kv_heads,
+                max_len,
+                attn.head_dim,
+                device=device,
+                dtype=model.dtype,
+            ),
+            torch.empty(
+                B,
+                attn.num_kv_heads,
+                max_len,
+                attn.head_dim,
+                device=device,
+                dtype=model.dtype,
+            ),
+        )
+        for _ in model.model.layers
+    ]
+    cache_size = 0
     for step in range(max_new_tokens):
         if token_ids.shape[0] == 0:
             break
 
-        predicted_tokens, new_kv_cache = batch_temperature_sampling(
+        predicted_tokens = batch_temperature_sampling(
             model=model,
             token_ids=token_ids,
             tau=tau,
-            attention_mask=attention_mask,
             kv_cache=kv_cache,
+            cache_size=cache_size,
+            attention_mask=attention_mask,
         )
-        kv_cache = new_kv_cache if use_kv_cache else None
+        cache_size = token_ids.shape[1]
         stopped = predicted_tokens == stop_token_id
         finished_sequences = torch.logical_or(stopped, finished_sequences)
         tokens_to_add = torch.where(
