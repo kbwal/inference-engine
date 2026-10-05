@@ -7,7 +7,7 @@ if __name__ == "__main__":
     model = make_granite_1b_400m(device="meta")
     tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-3.1-1b-a400m-base")
     assert type(tokenizer.eos_token_id) == int
-    model.load_state_dict(load_weights(device="mps"), assign=True)
+    model.load_state_dict(load_weights(device="cuda"), assign=True)
 
     MAX_NEW_TOKENS = 64
     inputs = [
@@ -24,7 +24,7 @@ if __name__ == "__main__":
         tau=0.3,
         max_new_tokens=MAX_NEW_TOKENS,
         stop_token_id=tokenizer.eos_token_id,
-        device="mps",
+        device="cuda",
         drop_stopped=False,
     )
     print("result: ", res)

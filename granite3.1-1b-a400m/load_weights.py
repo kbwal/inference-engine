@@ -4,7 +4,7 @@ from huggingface_hub import snapshot_download
 
 
 def load_weights(
-    model_path: str | None = None, device: str = "cpu"
+    model_path: str | None = None, device: str = "cuda"
 ) -> dict[str, torch.Tensor]:
     if model_path is None:
         model_path = snapshot_download(

@@ -10,7 +10,7 @@ class AttentionLayer(nn.Module):
         head_dim: int,
         num_q_heads: int,
         num_kv_heads: int,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -96,7 +96,7 @@ class MLPLayer(nn.Module):
         self,
         model_dim: int,
         intermediate_dim: int,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -125,7 +125,7 @@ class TransformerBlock(nn.Module):
         head_dim: int,
         num_q_heads: int,
         num_kv_heads: int,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -181,7 +181,7 @@ class Qwen3Model(nn.Module):
         vocab_size: int,
         num_layers: int,
         base: int = 1000000,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -202,7 +202,7 @@ class Qwen3Model(nn.Module):
                 )
             )
         self.norm = nn.RMSNorm(model_dim, eps=1e-6, device=device, dtype=dtype)
-        inv_freq_device = device if device != "meta" else "cpu"
+        inv_freq_device = device if device != "meta" else "cuda"
         self.register_buffer(
             "inv_freq",
             base
@@ -276,7 +276,7 @@ class Qwen3_1_7B(nn.Module):
         num_kv_heads: int,
         vocab_size: int,
         num_layers: int,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -313,7 +313,7 @@ class Qwen3_1_7B(nn.Module):
         return F.linear(x, w), new_cache
 
 
-def make_qwen_1_7(device: str = "mps", dtype: torch.dtype = torch.bfloat16):
+def make_qwen_1_7(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
     model_dim = 2048
     mlp_intermediate_dim = 6144
     head_dim = 128

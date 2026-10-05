@@ -13,7 +13,7 @@ tokenizer = gen_tokenizer()
 
 
 def encode(
-    msgs: list[list[dict[str, str]]], device: str = "cpu"
+    msgs: list[list[dict[str, str]]], device: str = "cuda"
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert all(
         list(msgs[0][i].keys()) == ["role", "content"] for i in range(len(msgs[0]))

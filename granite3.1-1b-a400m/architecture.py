@@ -11,7 +11,7 @@ class AttentionLayer(nn.Module):
         num_q_heads: int,
         num_kv_heads: int,
         attention_multiplier: float = 0.015625,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -116,7 +116,7 @@ class MLPLayer(nn.Module):
         intermediate_dim: int,
         num_experts: int,
         num_active_experts: int,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -162,7 +162,7 @@ class TransformerBlock(nn.Module):
         num_active_experts: int,
         attention_multiplier: float = 0.015625,
         residual_multiplier: float = 0.22,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -231,7 +231,7 @@ class Granite3_1Model(nn.Module):
         embedding_multiplier: float = 12.0,
         attention_multiplier: float = 0.015625,
         residual_multiplier: float = 0.22,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -257,7 +257,7 @@ class Granite3_1Model(nn.Module):
                 )
             )
         self.norm = nn.RMSNorm(model_dim, eps=1e-6, device=device, dtype=dtype)
-        inv_freq_device = device if device != "meta" else "cpu"
+        inv_freq_device = device if device != "meta" else "cuda"
         self.register_buffer(
             "inv_freq",
             base
@@ -337,7 +337,7 @@ class Granite3_1_1B_400M(nn.Module):
         attention_multiplier: float = 0.015625,
         residual_multiplier: float = 0.22,
         logits_scaling: float = 6.0,
-        device: str = "mps",
+        device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -373,7 +373,7 @@ class Granite3_1_1B_400M(nn.Module):
         return F.linear(x, w) / self.logits_scaling, new_cache
 
 
-def make_granite_1b_400m(device: str = "mps", dtype: torch.dtype = torch.bfloat16):
+def make_granite_1b_400m(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
     model_dim = 1024
     mlp_intermediate_dim = 512
     head_dim = 64  # hidden_size / num_heads; config has no explicit head_dim

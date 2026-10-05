@@ -7,7 +7,7 @@ if __name__ == "__main__":
     model = make_qwen_1_7(device="meta")
     stop_token_id = gen_tokenizer().eos_token_id
     assert type(stop_token_id) == int
-    model.load_state_dict(load_weights(device="mps"), assign=True)
+    model.load_state_dict(load_weights(device="cuda"), assign=True)
 
     MAX_NEW_TOKENS = 64
     inputs = [
@@ -23,7 +23,7 @@ if __name__ == "__main__":
         tau=0.3,
         max_new_tokens=MAX_NEW_TOKENS,
         stop_token_id=stop_token_id,
-        device="mps",
+        device="cuda",
         drop_stopped=False,
     )
     print("result: ", res)

@@ -16,7 +16,7 @@ class GenerationStats:
 
 
 def sync():
-    torch.mps.synchronize()
+    torch.cuda.synchronize()
 
 
 @torch.inference_mode()
