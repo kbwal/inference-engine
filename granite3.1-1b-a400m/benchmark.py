@@ -21,7 +21,7 @@ if __name__ == "__main__":
 
     print(
         f"{'batch':>5} | {'prompt tok':>10} | {'ttft (ms)':>9} | {'prefill tok/s':>13} | "
-        f"{'decode tok/s/seq':>16} | {'decode tok/s total':>18}"
+        f"{'capture (ms)':>12} | {'decode tok/s/seq':>16} | {'decode tok/s total':>18}"
     )
     for batch_size in BATCH_SIZES:
         inputs = [prompts[i % len(prompts)] for i in range(batch_size)]
@@ -35,7 +35,6 @@ if __name__ == "__main__":
             max_new_tokens=8,
             stop_token_id=tokenizer.eos_token_id,
             device="cuda",
-            drop_stopped=False,
         )
         res, stats = autoregress(
             model=model,
@@ -45,11 +44,11 @@ if __name__ == "__main__":
             max_new_tokens=MAX_NEW_TOKENS,
             stop_token_id=tokenizer.eos_token_id,
             device="cuda",
-            drop_stopped=False,
         )
         print(
             f"{batch_size:>5} | {stats.prompt_tokens:>10} | {stats.ttft_s * 1000:>9.1f} | "
-            f"{stats.prefill_tok_s:>13.1f} | {stats.decode_tok_s_per_seq:>16.2f} | "
+            f"{stats.prefill_tok_s:>13.1f} | {stats.capture_s * 1000:>12.1f} | "
+            f"{stats.decode_tok_s_per_seq:>16.2f} | "
             f"{stats.decode_tok_s_batch:>18.2f}"
         )
 

@@ -43,13 +43,12 @@ class AttentionLayer(nn.Module):
     def update_kv(
         self,
         past_kv: tuple[torch.Tensor, torch.Tensor],
-        cache_size: int,
+        cache_pos: torch.Tensor,
         new_k: torch.Tensor,
         new_v: torch.Tensor,
     ) -> None:
-        T = new_k.size(2)
-        past_kv[0][:, :, cache_size : cache_size + T] = new_k
-        past_kv[1][:, :, cache_size : cache_size + T] = new_v
+        past_kv[0].index_copy_(dim=2, index=cache_pos, source=new_k)
+        past_kv[1].index_copy_(dim=2, index=cache_pos, source=new_v)
 
     def forward(
         self,
@@ -58,7 +57,7 @@ class AttentionLayer(nn.Module):
         sin: torch.Tensor,
         mask: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
-        cache_size: int,
+        cache_pos: torch.Tensor,
     ):
         B, T, _ = x.shape  # note: x is newly generated tokens NOT in the kv cache
         q: torch.Tensor = self.q_proj(x)
@@ -72,10 +71,8 @@ class AttentionLayer(nn.Module):
         q = self.rope(q, cos=cos, sin=sin)
         k = self.rope(k, cos=cos, sin=sin)
 
-        self.update_kv(kv_cache, cache_size, k, v)
-
-        k = kv_cache[0][:, :, : cache_size + T]
-        v = kv_cache[1][:, :, : cache_size + T]
+        self.update_kv(kv_cache, cache_pos, k, v)
+        k, v = kv_cache
 
         out = F.scaled_dot_product_attention(
             q,
@@ -196,7 +193,7 @@ class TransformerBlock(nn.Module):
         sin: torch.Tensor,
         mask: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
-        cache_size: int,
+        cache_pos: torch.Tensor,
     ):
         x = (
             x
@@ -206,7 +203,7 @@ class TransformerBlock(nn.Module):
                 sin=sin,
                 mask=mask,
                 kv_cache=kv_cache,
-                cache_size=cache_size,
+                cache_pos=cache_pos,
             )
             * self.residual_multiplier
         )
@@ -277,36 +274,23 @@ class Granite3_1Model(nn.Module):
         self,
         x: torch.Tensor,
         kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
-        cache_size: int,
-        attention_mask: torch.Tensor | None = None,
+        cache_pos: torch.Tensor,  # [T], cache slots to write into
+        positions: torch.Tensor,  # [B, T], RoPE
+        key_mask: torch.Tensor,  # [B, max_len] False for padding
     ):
         assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
-        x = (
-            self.embed_tokens(x[:, cache_size:]) * self.embedding_multiplier
-        )  # everything in cache is sliced out during forward
-        B, T, _ = x.shape
+        x = self.embed_tokens(x) * self.embedding_multiplier
 
-        if attention_mask is not None:
-            pos = attention_mask.long().cumsum(-1) - 1
-            pos = pos.masked_fill(attention_mask == 0, 0)[:, cache_size:]
-            causal_mask = torch.ones(
-                T, T + cache_size, dtype=torch.bool, device=x.device
-            ).tril(diagonal=cache_size)
-            valid_keys = attention_mask[:, None, None, :].bool()
-            mask = causal_mask[None, None, :, :] & valid_keys  # [B,1,T,T]
-        else:
-            pos = (
-                torch.arange(cache_size, cache_size + T, device=x.device)
-                .unsqueeze(0)
-                .expand(B, T)
-            )
-            mask = torch.tril(
-                torch.ones(T, T + cache_size, device=x.device),
-                diagonal=cache_size,
-            ).bool()
+        max_len = key_mask.size(-1)
+        slots = torch.arange(max_len, device=x.device)
+        causal = slots.unsqueeze(dim=0) <= cache_pos.unsqueeze(dim=1)  # [T, max_len]
+        mask = (
+            causal[None, None, :, :] & key_mask[:, None, None, :]
+        )  # [B, 1, T, max_len]
 
         angles = (
-            pos[:, None, :, None] * self.get_buffer("inv_freq")[None, None, None, :]
+            positions[:, None, :, None]
+            * self.get_buffer("inv_freq")[None, None, None, :]
         )
         cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
 
@@ -316,8 +300,8 @@ class Granite3_1Model(nn.Module):
                 cos=cos,
                 sin=sin,
                 mask=mask,
-                kv_cache=kv_cache[i] if kv_cache is not None else None,
-                cache_size=cache_size,
+                kv_cache=kv_cache[i],
+                cache_pos=cache_pos,
             )
         x = self.norm(x)
         return x
@@ -366,12 +350,17 @@ class Granite3_1_1B_400M(nn.Module):
         self,
         x: torch.Tensor,
         kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
-        cache_size: int,
-        attention_mask: torch.Tensor | None = None,
+        cache_pos: torch.Tensor,  # [T], cache slots to write into
+        positions: torch.Tensor,  # [B, T], RoPE
+        key_mask: torch.Tensor,  # [B, max_len] False for padding
     ):  # returns logits
         assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
         x = self.model(
-            x, attention_mask=attention_mask, kv_cache=kv_cache, cache_size=cache_size
+            x,
+            kv_cache=kv_cache,
+            cache_pos=cache_pos,
+            positions=positions,
+            key_mask=key_mask,
         )
         x = x[:, -1, :]
         w = self.model.embed_tokens.weight

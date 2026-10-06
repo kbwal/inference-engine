@@ -2,6 +2,7 @@ from architecture import Qwen3_1_7B, AttentionLayer
 import time
 from dataclasses import dataclass
 import torch
+import torch.nn.functional as F
 from run_tokenization import encode, decode
 
 
@@ -10,8 +11,9 @@ class GenerationStats:
     prompt_tokens: int  # non-pad
     ttft_s: float  # time to first token
     prefill_tok_s: float  # input_tokens / ttft_s
-    decode_steps: int  # max over all in batch, even if some are dropped
-    decode_s: float  # overall_time - ttft
+    decode_steps: int  # max over all in batch
+    capture_s: float  # cuda graph capture, excluded from both ttft and decode
+    decode_s: float  # overall_time - ttft - capture
     decode_tok_s_per_seq: float  # decode_steps / decode_seconds
     decode_tok_s_batch: float  # decode_tokens / decode_seconds
 
@@ -20,52 +22,48 @@ def sync():
     torch.cuda.synchronize()
 
 
-@torch.inference_mode()
-def batch_greedy_decode(
+def capture_decode_graph(
     model: Qwen3_1_7B,
-    token_ids: torch.Tensor,
     kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
-    cache_size: int,
-    attention_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    raw = model.forward(
-        token_ids,
-        attention_mask=attention_mask,
-        kv_cache=kv_cache,
-        cache_size=cache_size,
-    )
-    predicted_tokens = torch.argmax(raw, -1, keepdim=True)
-    return predicted_tokens
+    next_input: torch.Tensor,
+    cache_pos: torch.Tensor,
+    positions: torch.Tensor,
+    key_mask: torch.Tensor,
+):
+    static_input = next_input.clone()
+    static_cache_pos = cache_pos.clone()
+    static_positions = positions.clone()
 
-
-@torch.inference_mode()
-def batch_temperature_sampling(
-    model: Qwen3_1_7B,
-    token_ids: torch.Tensor,
-    tau: float,
-    kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
-    cache_size: int,
-    attention_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    assert tau >= 0.0, "make sure temperature is positive!"
-
-    if tau == 0.0:
-        return batch_greedy_decode(
-            model=model,
-            token_ids=token_ids,
+    def run() -> torch.Tensor:
+        return model(
+            static_input,
             kv_cache=kv_cache,
-            cache_size=cache_size,
-            attention_mask=attention_mask,
+            cache_pos=static_cache_pos,
+            positions=static_positions,
+            key_mask=key_mask,
         )
 
-    raw = model(
-        token_ids,
-        attention_mask=attention_mask,
-        kv_cache=kv_cache,
-        cache_size=cache_size,
-    )
-    probs = (raw / tau).softmax(-1)
-    predicted_tokens = torch.multinomial(probs, num_samples=1)
+    # warmup
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            run()
+    torch.cuda.current_stream().wait_stream(s)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_logits = run()
+
+    return graph, static_input, static_cache_pos, static_positions, static_logits
+
+
+def sample_from_logits(logits: torch.Tensor, tau: float) -> torch.Tensor:
+    if tau == 0:
+        predicted_tokens = torch.argmax(logits, -1, keepdim=True)
+    else:
+        probs = (logits / tau).softmax(-1)
+        predicted_tokens = torch.multinomial(probs, num_samples=1)
     return predicted_tokens
 
 
@@ -77,7 +75,6 @@ def autoregress(
     max_new_tokens: int,
     stop_token_id: int,
     device: str,
-    drop_stopped: bool = True,
 ) -> tuple[list[str], GenerationStats]:
     model = model.to(device)
     sync()
@@ -91,20 +88,20 @@ def autoregress(
     B = token_ids.shape[0]
     prompt_len = token_ids.shape[1]
 
-    finished_sequences = torch.zeros((token_ids.shape[0], 1), device=device).bool()
-    active_indices = torch.arange(B, device=device)
-    outputs: list[torch.Tensor | None] = [None] * B
+    finished_sequences = torch.zeros((B, 1), device=device).bool()
     prompt_tokens = attention_mask.sum()
 
     t_first = t_start
+    t_decode_start = t_start
     num_steps = 0
     decode_tokens = 0
 
     max_len = prompt_len + max_new_tokens
     attn: AttentionLayer = model.model.layers[0].self_attn  # type: ignore
+
     kv_cache = [
         (
-            torch.empty(
+            torch.zeros(
                 B,
                 attn.num_kv_heads,
                 max_len,
@@ -112,7 +109,7 @@ def autoregress(
                 device=device,
                 dtype=model.dtype,
             ),
-            torch.empty(
+            torch.zeros(
                 B,
                 attn.num_kv_heads,
                 max_len,
@@ -123,20 +120,55 @@ def autoregress(
         )
         for _ in model.model.layers
     ]
-    cache_size = 0
-    for step in range(max_new_tokens):
-        if token_ids.shape[0] == 0:
-            break
+    cache_pos = torch.arange(prompt_len, device=kv_cache[0][0].device)
+    positions = (attention_mask.cumsum(dim=1) - 1).clamp(0)
+    key_mask = F.pad(attention_mask, (0, max_len - prompt_len), value=1).bool()
+    next_input = token_ids
 
-        predicted_tokens = batch_temperature_sampling(
-            model=model,
-            token_ids=token_ids,
-            tau=tau,
-            kv_cache=kv_cache,
-            cache_size=cache_size,
-            attention_mask=attention_mask,
+    graph: torch.cuda.CUDAGraph | None = None
+    static_input: torch.Tensor | None = None
+    static_cache_pos: torch.Tensor | None = None
+    static_positions: torch.Tensor | None = None
+    static_logits: torch.Tensor | None = None
+
+    for step in range(max_new_tokens):
+        if step == 0:
+            # no need to capture a graph on prefill cuz it's variable length
+            # plus prefill is high arithmetic intensity, so the overhead doesn't matter as much
+            logits = model(
+                token_ids,
+                kv_cache=kv_cache,
+                cache_pos=cache_pos,
+                positions=positions,
+                key_mask=key_mask,
+            )
+        else:
+            assert (
+                graph is not None
+                and static_input is not None
+                and static_cache_pos is not None
+                and static_positions is not None
+                and static_logits is not None
+            )
+            # we need to pass in the same pointers every time!
+            static_input.copy_(next_input)
+            static_cache_pos.copy_(cache_pos)
+            static_positions.copy_(positions)
+            graph.replay()
+            logits = static_logits
+
+        predicted_tokens = sample_from_logits(logits=logits, tau=tau)
+
+        cache_pos = (
+            cache_pos[-1:]
+            + 1
+            + torch.arange(predicted_tokens.shape[1], device=cache_pos.device)
         )
-        cache_size = token_ids.shape[1]
+        positions = (
+            positions[:, -1:]
+            + 1
+            + torch.arange(predicted_tokens.shape[1], device=positions.device)
+        )
         stopped = predicted_tokens == stop_token_id
         finished_sequences = torch.logical_or(stopped, finished_sequences)
         tokens_to_add = torch.where(
@@ -144,51 +176,39 @@ def autoregress(
             stop_token_id,
             predicted_tokens,
         )
+        next_input = tokens_to_add
         token_ids = torch.cat((token_ids, tokens_to_add), dim=1)
-        attention_mask = torch.cat(
-            (
-                attention_mask,
-                torch.ones((token_ids.size(0), 1), device=device),
-            ),
-            dim=-1,
-        )
-
-        if drop_stopped and stopped.any():
-            stopped_indexes = torch.where(stopped.squeeze(-1))[0]
-            for idx in stopped_indexes:
-                outputs[int(active_indices[idx].item())] = token_ids[idx, prompt_len:]
-            keep = ~(stopped.squeeze(-1))
-            token_ids = token_ids[keep]
-            attention_mask = attention_mask[keep]
-            finished_sequences = finished_sequences[keep]
-            active_indices = active_indices[keep]
-            if kv_cache is not None:
-                kv_cache = [(k[keep], v[keep]) for k, v in kv_cache]
 
         num_steps += 1
         if step == 0:
             sync()
             t_first = time.perf_counter()
+            graph, static_input, static_cache_pos, static_positions, static_logits = (
+                capture_decode_graph(
+                    model, kv_cache, next_input, cache_pos, positions, key_mask
+                )
+            )
+            sync()
+            t_decode_start = time.perf_counter()
         else:
             decode_tokens += predicted_tokens.shape[0]
 
     sync()
     t_end = time.perf_counter()
 
-    for idx in range(token_ids.shape[0]):
-        outputs[int(active_indices[idx].item())] = token_ids[idx, prompt_len:]
-
     n_prompt = int(prompt_tokens.item())
     ttft_s = t_first - t_start
-    decode_s = t_end - t_first
+    capture_s = t_decode_start - t_first
+    decode_s = t_end - t_decode_start
     decode_steps = max(num_steps - 1, 0)
     stats = GenerationStats(
         prompt_tokens=n_prompt,
         ttft_s=ttft_s,
         prefill_tok_s=n_prompt / ttft_s,
         decode_steps=decode_steps,
+        capture_s=capture_s,
         decode_s=decode_s,
         decode_tok_s_per_seq=decode_steps / decode_s if decode_steps else 0.0,
         decode_tok_s_batch=decode_tokens / decode_s if decode_steps else 0.0,
     )
-    return decode([out for out in outputs if out is not None]), stats
+    return decode(token_ids[:, prompt_len:]), stats
