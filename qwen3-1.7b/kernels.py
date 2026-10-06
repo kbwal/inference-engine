@@ -3,6 +3,15 @@ import triton.language as tl
 import torch
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=st)
+        for bn in [32, 64, 128]
+        for w in [4, 8]
+        for st in [2, 3]
+    ],
+    key=["num_batches", "max_len"],
+)
 @triton.jit
 def decode_attention_kernel(
     q_ptr,
@@ -20,27 +29,36 @@ def decode_attention_kernel(
     stride_oh,
     stride_mb,
     scale,
+    num_batches,
+    max_len,
     GQA_RATIO: tl.constexpr,
     D: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    d_offsets = tl.arange(0, D)
+    h_offsets = tl.arange(0, 16)
+    h_valid = h_offsets < GQA_RATIO
+
     # output is (B, H, 1, D), so index by (B, H)
     b_idx = tl.program_id(axis=0)  # batch
     h_idx = tl.program_id(axis=1)  # head
-    kv_head_idx = h_idx // GQA_RATIO
 
-    d_offsets = tl.arange(0, D)
-
-    q_offsets = (b_idx * stride_qb + h_idx * stride_qh) + d_offsets
-    q = tl.load(q_ptr + q_offsets)[None, :].to(tl.float32)  # (1, D)
+    q = tl.load(
+        q_ptr
+        + b_idx * stride_qb
+        + (h_idx * GQA_RATIO + h_offsets)[:, None] * stride_qh
+        + d_offsets[None, :],
+        mask=h_valid[:, None],
+        other=0.0,
+    )  # (16, D), last 14 are 0s. this makes it use more compute, but this kernel is memory bound
 
     cache_pos = tl.load(cache_pos_ptr)  # [1]
 
-    kv_bh_offsets = b_idx * stride_kb + kv_head_idx * stride_kh
+    kv_bh_offsets = b_idx * stride_kb + h_idx * stride_kh
 
-    max_old = float("-inf")
-    running_sum = 0.0
-    accumulator = tl.zeros((D,), dtype=tl.float32)
+    max_old = tl.full((16,), value=float("-inf"), dtype=tl.float32)
+    running_sum = tl.zeros((16,), dtype=tl.float32)
+    accumulator = tl.zeros((16, D), dtype=tl.float32)
 
     for start_n in range(0, cache_pos + 1, BLOCK_N):
         n_offsets = start_n + tl.arange(0, BLOCK_N)
@@ -56,31 +74,37 @@ def decode_attention_kernel(
 
         key_mask_offsets = b_idx * stride_mb + n_offsets
         key_mask = tl.load(key_mask_ptr + key_mask_offsets, mask=in_cache, other=False)[
-            :, None
-        ]  # [BLOCK_N, 1]
+            None, :
+        ]  # [1, BLOCK_N]
 
-        mask = in_cache[:, None] & key_mask  # [BLOCK_N, 1]
+        mask = in_cache[None, :] & key_mask  # [1, BLOCK_N]
 
-        attn_scores = (
-            tl.sum(k.to(tl.float32) * q, axis=1, keep_dims=True) * scale
-        )  # (BLOCK_N, 1)
+        attn_scores = tl.dot(q, tl.trans(k)) * scale  # [16, BLOCK_N]
         attn_scores = tl.where(mask, attn_scores, float("-inf"))
 
-        max_score = tl.max(attn_scores)
-        max_new = tl.maximum(max_score, max_old)  # type: ignore
+        max_score = tl.max(attn_scores, axis=1)
+        max_new = tl.maximum(max_score, max_old)
         safe_max_new = tl.where(max_new == float("-inf"), 0.0, max_new)
-        alpha = tl.exp(max_old - safe_max_new)  # type: ignore
 
-        numerator = tl.exp(attn_scores - safe_max_new)  # type: ignore
-        running_sum = running_sum * alpha + tl.sum(numerator)
+        alpha = tl.exp(max_old - safe_max_new)
+        numerator = tl.exp(attn_scores - safe_max_new[:, None])
+        running_sum = running_sum * alpha + tl.sum(numerator, axis=1)
 
-        weighted_sum = tl.sum(numerator * v.to(tl.float32), axis=0)
-        accumulator = accumulator * alpha + weighted_sum
+        weighted_sum = tl.dot(numerator.to(v.dtype), v)  # (16, D)
+        accumulator = accumulator * alpha[:, None] + weighted_sum
+
         max_old = max_new
 
-    out = accumulator / running_sum
-    out_offsets = (b_idx * stride_ob + h_idx * stride_oh) + d_offsets
-    tl.store(output_ptr + out_offsets, out)
+    out = accumulator / running_sum[:, None]
+
+    tl.store(
+        output_ptr
+        + b_idx * stride_ob
+        + (h_idx * GQA_RATIO + h_offsets)[:, None] * stride_oh
+        + d_offsets[None, :],
+        out,
+        mask=h_valid[:, None],
+    )
 
 
 def decode_attention(
@@ -89,13 +113,13 @@ def decode_attention(
     key_mask: torch.Tensor,
     cache_pos: torch.Tensor,
     scale,
-    BLOCK_N: int = 64,
 ):
     k_cache, v_cache = kv_cache
     B, Hq, T, D = q.shape
+    Hkv = k_cache.shape[1]
     assert T == 1, "somehow T != 1 in the custom decode attention kernel!"
     out = torch.empty(B, Hq, 1, D, device=q.device, dtype=q.dtype)
-    decode_attention_kernel[(B, Hq)](
+    decode_attention_kernel[(B, Hkv)](
         q,
         k_cache,
         v_cache,
@@ -111,9 +135,10 @@ def decode_attention(
         out.stride(dim=1),
         key_mask.stride(dim=0),
         scale,
-        GQA_RATIO=Hq // k_cache.shape[1],  # type: ignore
-        D=D,  # type: ignore
-        BLOCK_N=BLOCK_N,  # type: ignore
+        num_batches=B,
+        max_len=triton.next_power_of_2(k_cache.shape[2]),
+        GQA_RATIO=Hq // Hkv,
+        D=D,
     )
     return out
 

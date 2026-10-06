@@ -43,7 +43,7 @@ def capture_decode_graph(
             key_mask=key_mask,
         )
 
-    # warmup
+    # warmup, this is necessary for triton autotune to happen before graph capture
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
