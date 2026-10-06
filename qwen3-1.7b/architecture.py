@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from kernels import decode_attention
 
 
 class AttentionLayer(nn.Module):
@@ -58,6 +59,7 @@ class AttentionLayer(nn.Module):
         mask: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         cache_pos: torch.Tensor,
+        key_mask: torch.Tensor,
     ):
         B, T, _ = x.shape  # note: x is newly generated tokens NOT in the kv cache
         q: torch.Tensor = self.q_proj(x)
@@ -74,9 +76,14 @@ class AttentionLayer(nn.Module):
         self.update_kv(kv_cache, cache_pos, k, v)
         k, v = kv_cache
 
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=False, enable_gqa=True
-        )
+        if T == 1:  # decode: only read the filled slots
+            out = decode_attention(
+                q, kv_cache, key_mask, cache_pos, self.head_dim**-0.5
+            )
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, is_causal=False, enable_gqa=True
+            )
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.o_proj(out)
@@ -149,6 +156,7 @@ class TransformerBlock(nn.Module):
         mask: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         cache_pos: torch.Tensor,
+        key_mask: torch.Tensor,
     ):
         x = x + self.self_attn(
             self.input_layernorm(x),
@@ -157,6 +165,7 @@ class TransformerBlock(nn.Module):
             mask=mask,
             kv_cache=kv_cache,
             cache_pos=cache_pos,
+            key_mask=key_mask,
         )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
@@ -239,6 +248,7 @@ class Qwen3Model(nn.Module):
                 mask=mask,
                 kv_cache=kv_cache[i],
                 cache_pos=cache_pos,
+                key_mask=key_mask,
             )
         x = self.norm(x)
         return x
