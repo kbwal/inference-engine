@@ -10,7 +10,7 @@ if __name__ == "__main__":
     model.load_state_dict(load_weights(device="cuda"), assign=True)
 
     MAX_NEW_TOKENS = 128
-    BATCH_SIZES = [1, 4, 16, 64]
+    BATCH_SIZES = [1, 4, 16, 64, 128]
     prompts = [
         "how does the light dependent reaction work?",
         "write me a binary search in cpp.",

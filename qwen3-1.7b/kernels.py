@@ -32,7 +32,7 @@ def decode_attention_kernel(
     d_offsets = tl.arange(0, D)
 
     q_offsets = (b_idx * stride_qb + h_idx * stride_qh) + d_offsets
-    q = tl.load(q_ptr + q_offsets)[None, :].to(tl.float32)  # (D)
+    q = tl.load(q_ptr + q_offsets)[None, :].to(tl.float32)  # (1, D)
 
     cache_pos = tl.load(cache_pos_ptr)  # [1]
 

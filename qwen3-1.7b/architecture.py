@@ -21,14 +21,12 @@ class AttentionLayer(nn.Module):
         self.o_proj = nn.Linear(
             num_q_heads * head_dim, model_dim, bias=False, device=device, dtype=dtype
         )
-        self.q_proj = nn.Linear(
-            model_dim, num_q_heads * head_dim, bias=False, device=device, dtype=dtype
-        )
-        self.k_proj = nn.Linear(
-            model_dim, num_kv_heads * head_dim, bias=False, device=device, dtype=dtype
-        )
-        self.v_proj = nn.Linear(
-            model_dim, num_kv_heads * head_dim, bias=False, device=device, dtype=dtype
+        self.qkv_proj = nn.Linear(
+            model_dim,
+            head_dim * (num_q_heads + 2 * num_kv_heads),
+            bias=False,
+            device=device,
+            dtype=dtype,
         )
         self.q_norm = nn.RMSNorm(head_dim, eps=1e-6, device=device, dtype=dtype)
         self.k_norm = nn.RMSNorm(head_dim, eps=1e-6, device=device, dtype=dtype)
@@ -62,9 +60,14 @@ class AttentionLayer(nn.Module):
         key_mask: torch.Tensor,
     ):
         B, T, _ = x.shape  # note: x is newly generated tokens NOT in the kv cache
-        q: torch.Tensor = self.q_proj(x)
-        k: torch.Tensor = self.k_proj(x)
-        v: torch.Tensor = self.v_proj(x)
+        q, k, v = self.qkv_proj(x).split(
+            [
+                self.head_dim * self.num_q_heads,
+                self.head_dim * self.num_kv_heads,
+                self.head_dim * self.num_kv_heads,
+            ],
+            dim=-1,
+        )
 
         q = q.view(B, T, self.num_q_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)

@@ -14,4 +14,15 @@ def load_weights(
         with safe_open(filename=file, framework="pt", device=device) as f:
             for key in f.keys():
                 weights[key] = f.get_tensor(key)
+
+    for key in [k for k in weights if k.endswith("self_attn.q_proj.weight")]:
+        prefix = key.removesuffix("q_proj.weight")
+        weights[prefix + "qkv_proj.weight"] = torch.cat(
+            [
+                weights.pop(prefix + "q_proj.weight"),
+                weights.pop(prefix + "k_proj.weight"),
+                weights.pop(prefix + "v_proj.weight"),
+            ],
+            dim=0,
+        )
     return weights
