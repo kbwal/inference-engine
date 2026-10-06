@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from kernels import decode_attention
+from kernels import decode_attention, fused_rope_kv_decode
 
 
 class AttentionLayer(nn.Module):
@@ -73,17 +73,29 @@ class AttentionLayer(nn.Module):
         k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        q = self.rope(self.q_norm(q), cos=cos, sin=sin)
-        k = self.rope(self.k_norm(k), cos=cos, sin=sin)
-
-        self.update_kv(kv_cache, cache_pos, k, v)
-        k, v = kv_cache
-
-        if T == 1:  # decode: only read the filled slots
+        if T == 1:
+            q = fused_rope_kv_decode(
+                q,
+                k,
+                v,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos,
+                sin,
+                kv_cache,
+                cache_pos,
+                self.q_norm.eps,  # type: ignore
+            )
             out = decode_attention(
                 q, kv_cache, key_mask, cache_pos, self.head_dim**-0.5
             )
         else:
+            q = self.rope(self.q_norm(q), cos=cos, sin=sin)
+            k = self.rope(self.k_norm(k), cos=cos, sin=sin)
+
+            self.update_kv(kv_cache, cache_pos, k, v)
+            k, v = kv_cache
+
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, is_causal=False, enable_gqa=True
             )

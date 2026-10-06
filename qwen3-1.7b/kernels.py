@@ -116,3 +116,135 @@ def decode_attention(
         BLOCK_N=BLOCK_N,  # type: ignore
     )
     return out
+
+
+@triton.jit
+def fused_rope_kv_decode_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    q_norm_ptr,
+    k_norm_ptr,
+    output_ptr,
+    cache_pos_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    cos_ptr,
+    sin_ptr,
+    stride_qb,
+    stride_qh,
+    stride_kb,
+    stride_kh,
+    stride_vb,
+    stride_vh,
+    stride_cosb,
+    stride_sinb,
+    stride_cb,
+    stride_ch,
+    stride_cn,
+    stride_ob,
+    stride_oh,
+    eps,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+):
+    b_idx = tl.program_id(axis=0)
+    h_idx = tl.program_id(axis=1)
+
+    half_d_offsets = tl.arange(0, D // 2)  # load half
+    if h_idx < HQ:
+        q_offset = b_idx * stride_qb + h_idx * stride_qh
+
+        x1 = tl.load(q_ptr + q_offset + half_d_offsets).to(tl.float32)  # [D // 2]
+        x2 = tl.load(q_ptr + q_offset + half_d_offsets + D // 2).to(tl.float32)
+
+        rstd = tl.rsqrt((tl.sum(x1 * x1, axis=0) + tl.sum(x2 * x2, axis=0)) / D + eps)
+        x1 = x1 * rstd * tl.load(q_norm_ptr + half_d_offsets).to(tl.float32)
+        x2 = x2 * rstd * tl.load(q_norm_ptr + D // 2 + half_d_offsets).to(tl.float32)
+    else:
+        k_offset = b_idx * stride_kb + (h_idx - HQ) * stride_kh
+
+        x1 = tl.load(k_ptr + k_offset + half_d_offsets).to(tl.float32)  # [D // 2]
+        x2 = tl.load(k_ptr + k_offset + half_d_offsets + D // 2).to(tl.float32)
+
+        rstd = tl.rsqrt((tl.sum(x1 * x1, axis=0) + tl.sum(x2 * x2, axis=0)) / D + eps)
+        x1 = x1 * rstd * tl.load(k_norm_ptr + half_d_offsets).to(tl.float32)
+        x2 = x2 * rstd * tl.load(k_norm_ptr + D // 2 + half_d_offsets).to(tl.float32)
+
+    cos = tl.load(cos_ptr + b_idx * stride_cosb + half_d_offsets).to(
+        tl.float32
+    )  # [D // 2]
+    sin = tl.load(sin_ptr + b_idx * stride_sinb + half_d_offsets).to(tl.float32)
+
+    out1 = x1 * cos - x2 * sin  # [D // 2]
+    out2 = x1 * sin + x2 * cos
+    out = tl.cat(out1, out2)
+
+    if h_idx < HQ:
+        tl.store(
+            (output_ptr + stride_ob * b_idx + stride_oh * h_idx) + tl.arange(0, D), out
+        )
+    else:
+        j = h_idx - HQ
+        pos = tl.load(cache_pos_ptr)
+        d_offsets = tl.arange(0, D)
+        slot = (
+            b_idx * stride_cb + j * stride_ch + pos * stride_cn
+        )  # same strides for k_cache and v_cache
+
+        tl.store(k_cache_ptr + slot + d_offsets, out)
+        v = tl.load(v_ptr + b_idx * stride_vb + j * stride_vh + d_offsets)
+        tl.store(v_cache_ptr + slot + d_offsets, v)
+
+
+def fused_rope_kv_decode(
+    q: torch.Tensor,  # (B, Hq, 1, D)
+    k: torch.Tensor,  # (B, Hkv, 1, D)
+    v: torch.Tensor,
+    q_norm_weight: torch.Tensor,  # (D,)
+    k_norm_weight: torch.Tensor,
+    cos: torch.Tensor,  # (B, 1, 1, D // 2)
+    sin: torch.Tensor,
+    kv_cache: tuple[torch.Tensor, torch.Tensor],
+    cache_pos: torch.Tensor,
+    eps: float,
+):
+    # returns normed + roped q and writes kv cache
+    k_cache, v_cache = kv_cache
+    B, Hq, T, D = q.shape
+    Hkv = k.shape[1]
+    assert T == 1, "somehow T != 1 in the custom fused rope kernel!"
+    assert (
+        k_cache.stride() == v_cache.stride()
+    ), "kernel uses one set of strides for both caches"
+    out = torch.empty(B, Hq, 1, D, device=q.device, dtype=q.dtype)
+    fused_rope_kv_decode_kernel[(B, Hq + Hkv)](
+        q,
+        k,
+        v,
+        q_norm_weight,
+        k_norm_weight,
+        out,
+        cache_pos,
+        kv_cache[0],
+        kv_cache[1],
+        cos,
+        sin,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        cos.stride(0),
+        sin.stride(0),
+        kv_cache[0].stride(0),
+        kv_cache[0].stride(1),
+        kv_cache[0].stride(2),
+        out.stride(0),
+        out.stride(1),
+        eps,
+        HQ=Hq,  # type: ignore
+        D=D,  # type: ignore
+    )
+    return out
