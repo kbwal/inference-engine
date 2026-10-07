@@ -4,7 +4,9 @@ from huggingface_hub import snapshot_download
 
 
 def load_weights(
-    model_path: str | None = None, device: str = "cuda"
+    model_path: str | None = None,
+    device: str = "cuda",
+    tie_word_embeddings: bool = True,
 ) -> dict[str, torch.Tensor]:
     if model_path is None:
         model_path = snapshot_download("Qwen/Qwen3-1.7B", local_files_only=True)
@@ -13,6 +15,8 @@ def load_weights(
     for file in shard_files:
         with safe_open(filename=file, framework="pt", device=device) as f:
             for key in f.keys():
+                if tie_word_embeddings and key == "lm_head.weight":
+                    continue
                 weights[key] = f.get_tensor(key)
 
     for key in [k for k in weights if k.endswith("self_attn.q_proj.weight")]:

@@ -279,6 +279,7 @@ class Qwen3_1_7B(nn.Module):
         num_kv_heads: int,
         vocab_size: int,
         num_layers: int,
+        tie_word_embeddings: bool = True,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -295,9 +296,11 @@ class Qwen3_1_7B(nn.Module):
             device=device,
             dtype=dtype,
         )
-        self.lm_head = nn.Linear(
-            model_dim, vocab_size, bias=False, device=device, dtype=dtype
-        )
+        self.lm_head: nn.Linear | None = None
+        if not tie_word_embeddings:
+            self.lm_head = nn.Linear(
+                model_dim, vocab_size, bias=False, device=device, dtype=dtype
+            )
 
     def forward(
         self,
@@ -324,7 +327,10 @@ class Qwen3_1_7B(nn.Module):
         return F.linear(x, w)
 
 
-def make_qwen_1_7(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
+def make_qwen_1_7(
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+):
     model_dim = 2048
     mlp_intermediate_dim = 6144
     head_dim = 128
@@ -332,6 +338,7 @@ def make_qwen_1_7(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
     num_kv_heads = 8
     vocab_size = 151936
     num_layers = 28
+    tie_word_embeddings = True
     model = Qwen3_1_7B(
         model_dim=model_dim,
         mlp_intermediate_dim=mlp_intermediate_dim,
@@ -340,6 +347,7 @@ def make_qwen_1_7(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
         num_kv_heads=num_kv_heads,
         vocab_size=vocab_size,
         num_layers=num_layers,
+        tie_word_embeddings=tie_word_embeddings,
         device=device,
         dtype=dtype,
     )
