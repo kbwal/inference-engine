@@ -24,7 +24,7 @@ def sync():
 
 def capture_decode_graph(
     model: Qwen3_1_7B,
-    kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+    kv_cache: list[LayerKVCache],
     next_input: torch.Tensor,
     cache_pos: torch.Tensor,
     positions: torch.Tensor,
@@ -68,6 +68,42 @@ def make_layer_cache(B, Hkv, max_len, D, device):
     )
 
 
+def chunked_prefill(
+    model: Qwen3_1_7B,
+    token_ids: torch.Tensor,  # [B, T]
+    kv_cache: list[LayerKVCache],
+    cache_pos: torch.Tensor,
+    positions: torch.Tensor,  # [B, T]
+    key_mask: torch.Tensor,  # [B, max_len]
+    token_budget: int,
+) -> torch.Tensor:
+    B, T = token_ids.shape
+    chunk_b = max(1, token_budget // T)
+    logits = []
+    for b0 in range(0, B, chunk_b):
+        sl = slice(b0, b0 + chunk_b)
+        cache_view = [
+            LayerKVCache(
+                k=c.k[sl],
+                v=c.v[sl],
+                k_scale=c.k_scale[sl],
+                v_scale=c.v_scale[sl],
+                k_calibration=c.k_calibration[sl],
+            )
+            for c in kv_cache
+        ]
+        logits.append(
+            model(
+                token_ids[sl],
+                kv_cache=cache_view,
+                cache_pos=cache_pos,
+                positions=positions[sl],
+                key_mask=key_mask[sl],
+            )
+        )
+    return torch.cat(logits)
+
+
 def sample_from_logits(logits: torch.Tensor, tau: float) -> torch.Tensor:
     if tau == 0:
         predicted_tokens = torch.argmax(logits, -1, keepdim=True)
@@ -85,6 +121,7 @@ def autoregress(
     max_new_tokens: int,
     stop_token_id: int,
     device: str,
+    prefill_token_budget: int = 16384,
 ) -> tuple[list[str], GenerationStats]:
     model = model.to(device)
     sync()
@@ -128,12 +165,14 @@ def autoregress(
         if step == 0:
             # no need to capture a graph on prefill cuz it's variable length
             # plus prefill is high arithmetic intensity, so the overhead doesn't matter as much
-            logits = model(
+            logits = chunked_prefill(
+                model,
                 token_ids,
                 kv_cache=kv_cache,
                 cache_pos=cache_pos,
                 positions=positions,
                 key_mask=key_mask,
+                token_budget=prefill_token_budget,
             )
         else:
             assert (

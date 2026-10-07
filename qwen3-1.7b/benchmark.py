@@ -31,8 +31,9 @@ if __name__ == "__main__":
     model.load_state_dict(load_weights(device="cuda"), assign=True)
 
     MAX_NEW_TOKENS = 128
-    BATCH_SIZES = [1, 4, 16, 64, 128]
-    CONTEXTS = [128, 512, 2048]  # prompt length
+    BATCH_SIZES = [1, 4, 16, 32, 64, 128, 256, 512]
+    CONTEXTS = [128, 512, 2048, 4096, 8192]  # prompt length
+    MAX_BATCH = {128: 512, 512: 512, 2048: 128, 4096: 64, 8192: 32}
     prompts = [
         "how does the light dependent reaction work?",
         "write me a binary search in cpp.",
@@ -54,6 +55,8 @@ if __name__ == "__main__":
             make_prompt(p, ctx, tokenizer, template_overhead) for p in prompts
         ]
         for batch_size in BATCH_SIZES:
+            if batch_size > MAX_BATCH[ctx]:
+                break
             inputs = [ctx_prompts[i % len(ctx_prompts)] for i in range(batch_size)]
             oom = False
             try:
@@ -83,6 +86,8 @@ if __name__ == "__main__":
                 print(f"{batch_size:>5} | {ctx:>5} | out of memory")
                 continue
             assert stats is not None
+            # release this config's cached blocks so fragmentation doesn't OOM the near-full ones
+            torch.cuda.empty_cache()
             grid[(batch_size, ctx)] = stats.decode_tok_s_batch
             print(
                 f"{batch_size:>5} | {ctx:>5} | {stats.prompt_tokens // batch_size:>10} | "
