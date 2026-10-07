@@ -1,4 +1,4 @@
-from architecture import Qwen3_1_7B, AttentionLayer
+from architecture import Qwen3_1_7B, AttentionLayer, LayerKVCache
 import time
 from dataclasses import dataclass
 import torch
@@ -58,6 +58,16 @@ def capture_decode_graph(
     return graph, static_input, static_cache_pos, static_positions, static_logits
 
 
+def make_layer_cache(B, Hkv, max_len, D, device):
+    return LayerKVCache(
+        k=torch.zeros(B, Hkv, max_len, D, device=device, dtype=torch.int8),
+        v=torch.zeros(B, Hkv, max_len, D, device=device, dtype=torch.int8),
+        k_scale=torch.zeros(B, Hkv, max_len, device=device, dtype=torch.float32),
+        v_scale=torch.zeros(B, Hkv, max_len, device=device, dtype=torch.float32),
+        k_calibration=torch.ones(B, Hkv, 1, D, device=device, dtype=torch.float32),
+    )
+
+
 def sample_from_logits(logits: torch.Tensor, tau: float) -> torch.Tensor:
     if tau == 0:
         predicted_tokens = torch.argmax(logits, -1, keepdim=True)
@@ -100,27 +110,10 @@ def autoregress(
     attn: AttentionLayer = model.model.layers[0].self_attn  # type: ignore
 
     kv_cache = [
-        (
-            torch.zeros(
-                B,
-                attn.num_kv_heads,
-                max_len,
-                attn.head_dim,
-                device=device,
-                dtype=model.dtype,
-            ),
-            torch.zeros(
-                B,
-                attn.num_kv_heads,
-                max_len,
-                attn.head_dim,
-                device=device,
-                dtype=model.dtype,
-            ),
-        )
+        make_layer_cache(B, attn.num_kv_heads, max_len, attn.head_dim, device)
         for _ in model.model.layers
     ]
-    cache_pos = torch.arange(prompt_len, device=kv_cache[0][0].device)
+    cache_pos = torch.arange(prompt_len, device=kv_cache[0].k.device)
     positions = (attention_mask.cumsum(dim=1) - 1).clamp(0)
     key_mask = F.pad(attention_mask, (0, max_len - prompt_len), value=1).bool()
     next_input = token_ids

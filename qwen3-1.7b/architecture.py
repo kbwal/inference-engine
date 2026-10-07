@@ -1,7 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from kernels import decode_attention, fused_rope_kv_decode
+from kernels import (
+    LayerKVCache,
+    decode_attention,
+    fused_rope_kv_decode,
+    quantize_kv_prefill,
+)
 
 
 class AttentionLayer(nn.Module):
@@ -39,23 +44,13 @@ class AttentionLayer(nn.Module):
         out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
         return out
 
-    def update_kv(
-        self,
-        past_kv: tuple[torch.Tensor, torch.Tensor],
-        cache_pos: torch.Tensor,
-        new_k: torch.Tensor,
-        new_v: torch.Tensor,
-    ) -> None:
-        past_kv[0].index_copy_(dim=2, index=cache_pos, source=new_k)
-        past_kv[1].index_copy_(dim=2, index=cache_pos, source=new_v)
-
     def forward(
         self,
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: LayerKVCache,
         cache_pos: torch.Tensor,
         key_mask: torch.Tensor,
     ):
@@ -92,12 +87,15 @@ class AttentionLayer(nn.Module):
         else:
             q = self.rope(self.q_norm(q), cos=cos, sin=sin)
             k = self.rope(self.k_norm(k), cos=cos, sin=sin)
-
-            self.update_kv(kv_cache, cache_pos, k, v)
-            k, v = kv_cache
+            quantize_kv_prefill(k, v, key_mask, kv_cache)
 
             out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, is_causal=False, enable_gqa=True
+                q,
+                k,
+                v,
+                attn_mask=mask[..., :T],
+                is_causal=False,
+                enable_gqa=True,
             )
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
@@ -169,7 +167,7 @@ class TransformerBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: LayerKVCache,
         cache_pos: torch.Tensor,
         key_mask: torch.Tensor,
     ):
@@ -234,7 +232,7 @@ class Qwen3Model(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        kv_cache: list[LayerKVCache],
         cache_pos: torch.Tensor,  # [T], cache slots to write into
         positions: torch.Tensor,  # [B, T], RoPE
         key_mask: torch.Tensor,  # [B, max_len] False for padding
