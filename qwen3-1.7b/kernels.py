@@ -20,6 +20,9 @@ def decode_attention_kernel(
     output_ptr,
     key_mask_ptr,
     cache_pos_ptr,
+    partial_accumulation_ptr,
+    partial_max_ptr,
+    partial_running_sum_ptr,
     stride_qb,
     stride_qh,
     stride_kb,
@@ -34,6 +37,7 @@ def decode_attention_kernel(
     GQA_RATIO: tl.constexpr,
     D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
 ):
     d_offsets = tl.arange(0, D)
     h_offsets = tl.arange(0, 16)
@@ -53,6 +57,12 @@ def decode_attention_kernel(
     )  # (16, D), last 14 are 0s. this makes it use more compute, but this kernel is memory bound
 
     cache_pos = tl.load(cache_pos_ptr)  # [1]
+    n_end = cache_pos + 1
+
+    split_idx = tl.program_id(axis=2)
+    split_len = tl.cdiv(tl.cdiv(n_end, NUM_SPLITS), BLOCK_N) * BLOCK_N
+    split_start = split_idx * split_len
+    split_end = tl.minimum(split_start + split_len, n_end)
 
     kv_bh_offsets = b_idx * stride_kb + h_idx * stride_kh
 
@@ -60,9 +70,9 @@ def decode_attention_kernel(
     running_sum = tl.zeros((16,), dtype=tl.float32)
     accumulator = tl.zeros((16, D), dtype=tl.float32)
 
-    for start_n in range(0, cache_pos + 1, BLOCK_N):
+    for start_n in range(split_start, split_end, BLOCK_N):
         n_offsets = start_n + tl.arange(0, BLOCK_N)
-        in_cache = n_offsets <= cache_pos  # [BLOCK_N]
+        in_cache = n_offsets < split_end  # [BLOCK_N]
 
         kv_nd_offsets = n_offsets[:, None] * stride_kn + d_offsets[None, :]
         k = tl.load(
@@ -95,16 +105,61 @@ def decode_attention_kernel(
 
         max_old = max_new
 
-    out = accumulator / running_sum[:, None]
+    q_heads = h_idx * GQA_RATIO + h_offsets
 
-    tl.store(
-        output_ptr
-        + b_idx * stride_ob
-        + (h_idx * GQA_RATIO + h_offsets)[:, None] * stride_oh
-        + d_offsets[None, :],
-        out,
-        mask=h_valid[:, None],
-    )
+    if NUM_SPLITS == 1:
+        out = accumulator / running_sum[:, None]
+        tl.store(
+            output_ptr
+            + b_idx * stride_ob
+            + (h_idx * GQA_RATIO + h_offsets)[:, None] * stride_oh
+            + d_offsets[None, :],
+            out,
+            mask=h_valid[:, None],
+        )
+    else:
+        # we only saw a small slice, so we can't store the entire softmax in out
+        HQ = tl.num_programs(axis=1) * GQA_RATIO
+        rows = (b_idx * HQ + q_heads) * NUM_SPLITS + split_idx  # (16)
+        tl.store(
+            partial_accumulation_ptr + rows[:, None] * D + d_offsets[None, :],
+            accumulator,
+            mask=h_valid[:, None],
+        )
+        tl.store(partial_max_ptr + rows, max_old, mask=h_valid)
+        tl.store(partial_running_sum_ptr + rows, running_sum, mask=h_valid)
+
+
+@triton.jit
+def decode_attention_combine_kernel(
+    partial_accumulator_ptr,
+    partial_max_ptr,
+    partial_running_sum_ptr,
+    output_ptr,
+    stride_ob,
+    stride_oh,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+):
+    b_idx = tl.program_id(axis=0)
+    q_head = tl.program_id(axis=1)
+    s = tl.arange(0, NUM_SPLITS)
+    d_offsets = tl.arange(0, D)
+    rows = (b_idx * HQ + q_head) * NUM_SPLITS + s
+
+    maxs = tl.load(partial_max_ptr + rows)  # (S)
+    running_sum = tl.load(partial_running_sum_ptr + rows)  # (S)
+    accumulator = tl.load(
+        partial_accumulator_ptr + rows[:, None] * D + d_offsets[None, :]
+    )  # (S, D)
+
+    max_score = tl.max(maxs, axis=0)
+    numerator = tl.where(maxs == float("-inf"), 0.0, tl.exp(maxs - max_score))  # (S)
+    out = tl.sum(accumulator * numerator[:, None], axis=0) / tl.sum(
+        running_sum * numerator, axis=0
+    )  # type: ignore
+    tl.store(output_ptr + b_idx * stride_ob + q_head * stride_oh + d_offsets, out)
 
 
 def decode_attention(
@@ -119,13 +174,35 @@ def decode_attention(
     Hkv = k_cache.shape[1]
     assert T == 1, "somehow T != 1 in the custom decode attention kernel!"
     out = torch.empty(B, Hq, 1, D, device=q.device, dtype=q.dtype)
-    decode_attention_kernel[(B, Hkv)](
+
+    # we have 82 SMs, so if B is too small then not all are used
+    # use num_splits to split the work when B is low
+    num_splits = min(16, triton.next_power_of_2(max(1, 128 // (B * Hkv))))
+    if num_splits > 1:
+        partial_accumulator = torch.empty(
+            B, Hq, num_splits, D, device=q.device, dtype=torch.float32
+        )
+        partial_maxes = torch.empty(
+            B, Hq, num_splits, device=q.device, dtype=torch.float32
+        )
+        partial_running_sum = torch.empty(
+            B, Hq, num_splits, device=q.device, dtype=torch.float32
+        )
+    else:
+        partial_accumulator = partial_maxes = partial_running_sum = (
+            out  # unused, triton just needs a tensor
+        )
+
+    decode_attention_kernel[(B, Hkv, num_splits)](
         q,
         k_cache,
         v_cache,
         out,
         key_mask,
         cache_pos,
+        partial_accumulator,
+        partial_maxes,
+        partial_running_sum,
         q.stride(dim=0),
         q.stride(dim=1),
         k_cache.stride(dim=0),
@@ -139,7 +216,20 @@ def decode_attention(
         max_len=triton.next_power_of_2(k_cache.shape[2]),
         GQA_RATIO=Hq // Hkv,
         D=D,
+        NUM_SPLITS=num_splits,
     )
+    if num_splits > 1:
+        decode_attention_combine_kernel[(B, Hq)](
+            partial_accumulator,
+            partial_maxes,
+            partial_running_sum,
+            out,
+            out.stride(0),
+            out.stride(1),
+            HQ=Hq,  # type: ignore
+            D=D,  # type: ignore
+            NUM_SPLITS=num_splits,  # type: ignore
+        )
     return out
 
 

@@ -93,15 +93,4 @@ if __name__ == "__main__":
                 f"{stats.decode_tok_s_batch:>18.2f}"
             )
 
-    print("\ndecode tok/s total (rows = batch, cols = prompt ctx)")
-    print(f"{'batch':>5} | " + " | ".join(f"{ctx:>8}" for ctx in CONTEXTS))
-    for batch_size in BATCH_SIZES:
-        cells = [grid[(batch_size, ctx)] for ctx in CONTEXTS]
-        print(
-            f"{batch_size:>5} | "
-            + " | ".join(
-                f"{c:>8.0f}" if c is not None else f"{'oom':>8}" for c in cells
-            )
-        )
-
     print("\nsample output (last run, first seq):", repr(res[0]) if res else None)
