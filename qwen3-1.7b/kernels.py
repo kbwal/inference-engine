@@ -727,3 +727,113 @@ def prefill_attention(
         D=D,
     )
     return out
+
+
+@triton.jit
+def silu_mul_kernel(
+    gate_up_ptr,
+    output_ptr,
+    stride_in,
+    stride_out,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # [B, T, D] -> B & T squashed into one dim, so [N, D]
+    row, pid_d = tl.program_id(axis=0), tl.program_id(axis=1)
+    d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d_offsets < D
+
+    gate = tl.load(gate_up_ptr + row * stride_in + d_offsets, mask=mask).to(tl.float32)
+    data = tl.load(gate_up_ptr + row * stride_in + D + d_offsets, mask=mask).to(
+        tl.float32
+    )
+
+    tl.store(
+        output_ptr + row * stride_out + d_offsets,
+        gate * tl.sigmoid(gate) * data,
+        mask=mask,
+    )
+
+
+def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    B, T, two_d = gate_up.shape
+    D = two_d // 2
+    x = gate_up.view(-1, two_d)
+    out = torch.empty(x.shape[0], D, device=x.device, dtype=x.dtype)
+    BLOCK_D = 1024
+    silu_mul_kernel[(x.shape[0], triton.cdiv(D, BLOCK_D))](
+        x, out, x.stride(0), out.stride(0), D, BLOCK_D=BLOCK_D  # type: ignore
+    )
+    return out.view(B, T, D)
+
+
+@triton.jit
+def add_rms_norm_kernel(
+    residual_stream_ptr,
+    delta_ptr,
+    norm_weight_ptr,
+    new_residual_output_ptr,
+    new_norm_output_ptr,
+    eps,
+    stride_r,
+    stride_d,
+    stride_new_residual_output,
+    stride_new_norm_output,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # residual stream & delta is [B, T, D] -> merge into [N, D]
+    row = tl.program_id(axis=0)
+    d_offsets = tl.arange(0, BLOCK_D)
+    mask = d_offsets < D
+
+    residual_stream = tl.load(
+        residual_stream_ptr + row * stride_r + d_offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    delta = tl.load(delta_ptr + row * stride_d + d_offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    weight = tl.load(norm_weight_ptr + d_offsets, mask=mask, other=0.0).to(tl.float32)
+
+    residual_stream = (residual_stream + delta).to(
+        new_residual_output_ptr.dtype.element_ty
+    )
+    r = residual_stream.to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(r * r, axis=0) / D + eps)
+
+    tl.store(
+        new_residual_output_ptr + row * stride_new_residual_output + d_offsets,
+        residual_stream,
+        mask=mask,
+    )
+    tl.store(
+        new_norm_output_ptr + row * stride_new_norm_output + d_offsets,
+        residual_stream * inv_rms * weight,
+        mask=mask,
+    )
+
+
+def add_rms_norm(
+    residual: torch.Tensor, delta: torch.Tensor, rms_norm: torch.Tensor, eps: float
+):
+    B, T, D = residual.shape
+    residual = residual.view(B * T, D)
+    delta = delta.view(B * T, D)
+    new_residual = torch.empty_like(residual)
+    new_normed_residual = torch.empty_like(residual)
+    BLOCK_D = triton.next_power_of_2(D)
+    add_rms_norm_kernel[(B * T,)](
+        residual,
+        delta,
+        rms_norm,
+        new_residual,
+        new_normed_residual,
+        eps,
+        residual.stride(dim=0),
+        delta.stride(dim=0),
+        new_residual.stride(dim=0),
+        new_normed_residual.stride(dim=0),
+        D=D,  # type: ignore
+        BLOCK_D=BLOCK_D,  # type: ignore
+    )
+    return new_residual.view(B, T, D), new_normed_residual.view(B, T, D)

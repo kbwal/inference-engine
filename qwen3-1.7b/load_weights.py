@@ -18,7 +18,6 @@ def load_weights(
                 if tie_word_embeddings and key == "lm_head.weight":
                     continue
                 weights[key] = f.get_tensor(key)
-
     for key in [k for k in weights if k.endswith("self_attn.q_proj.weight")]:
         prefix = key.removesuffix("q_proj.weight")
         weights[prefix + "qkv_proj.weight"] = torch.cat(
@@ -26,6 +25,15 @@ def load_weights(
                 weights.pop(prefix + "q_proj.weight"),
                 weights.pop(prefix + "k_proj.weight"),
                 weights.pop(prefix + "v_proj.weight"),
+            ],
+            dim=0,
+        )
+    for key in [k for k in weights if k.endswith("mlp.gate_proj.weight")]:
+        prefix = key.removesuffix("gate_proj.weight")
+        weights[prefix + "gate_up_proj.weight"] = torch.cat(
+            [
+                weights.pop(prefix + "gate_proj.weight"),
+                weights.pop(prefix + "up_proj.weight"),
             ],
             dim=0,
         )

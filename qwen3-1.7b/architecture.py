@@ -7,6 +7,8 @@ from kernels import (
     fused_rope_kv_decode,
     quantize_kv_prefill,
     prefill_attention,
+    silu_mul,
+    add_rms_norm,
 )
 
 
@@ -104,11 +106,8 @@ class MLPLayer(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
-        self.gate_proj = nn.Linear(
-            model_dim, intermediate_dim, bias=False, device=device, dtype=dtype
-        )
-        self.up_proj = nn.Linear(
-            model_dim, intermediate_dim, bias=False, device=device, dtype=dtype
+        self.gate_up_proj = nn.Linear(
+            model_dim, 2 * intermediate_dim, bias=False, device=device, dtype=dtype
         )
         self.down_proj = nn.Linear(
             intermediate_dim, model_dim, bias=False, device=device, dtype=dtype
@@ -116,9 +115,8 @@ class MLPLayer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         # x does not include tokens in kv cache
-        gate = F.silu(self.gate_proj(x))
-        data = self.up_proj(x)
-        return self.down_proj(gate * data)
+        gate_up = self.gate_up_proj(x)
+        return self.down_proj(silu_mul(gate_up))
 
 
 class TransformerBlock(nn.Module):
@@ -156,7 +154,10 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,  # previous block's MLP
+        residual: (
+            torch.Tensor | None
+        ),  # if there was a previous block, this is that residual
         cos: torch.Tensor,
         sin: torch.Tensor,
         kv_cache: LayerKVCache,
@@ -164,8 +165,14 @@ class TransformerBlock(nn.Module):
         key_mask: torch.Tensor,
         pad_len: torch.Tensor,
     ):
-        x = x + self.self_attn(
-            self.input_layernorm(x),
+        if residual is None:
+            residual, normed = x, self.input_layernorm(x)
+        else:
+            residual, normed = add_rms_norm(
+                residual, x, self.input_layernorm.weight, self.input_layernorm.eps  # type: ignore
+            )
+        attn_out = self.self_attn(
+            normed,
             cos=cos,
             sin=sin,
             kv_cache=kv_cache,
@@ -173,8 +180,13 @@ class TransformerBlock(nn.Module):
             key_mask=key_mask,
             pad_len=pad_len,
         )
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        residual, normed = add_rms_norm(
+            residual,
+            attn_out,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,  # type: ignore
+        )
+        return self.mlp(normed), residual
 
 
 class Qwen3Model(nn.Module):
@@ -241,9 +253,11 @@ class Qwen3Model(nn.Module):
         cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
         pad_len = T - key_mask[:, :T].sum(dim=1)
 
+        residual = None
         for i, block in enumerate(self.layers):
-            x = block(
+            x, residual = block(
                 x,
+                residual,
                 cos=cos,
                 sin=sin,
                 kv_cache=kv_cache[i],
@@ -251,7 +265,7 @@ class Qwen3Model(nn.Module):
                 key_mask=key_mask,
                 pad_len=pad_len,
             )
-        x = self.norm(x)
+        _, x = add_rms_norm(residual, x, self.norm.weight, self.norm.eps)  # type: ignore
         return x
 
 
