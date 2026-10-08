@@ -837,3 +837,90 @@ def add_rms_norm(
         BLOCK_D=BLOCK_D,  # type: ignore
     )
     return new_residual.view(B, T, D), new_normed_residual.view(B, T, D)
+
+
+@triton.jit
+def sampling_kernel(
+    seed_ptr,
+    logits_ptr,
+    partial_max_ptr,
+    partial_idx_ptr,
+    tau,
+    stride_lb,
+    stride_pb,
+    V: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    # grid will be (B, cdiv(V, BLOCK_V))
+    b_idx, pid_v = tl.program_id(axis=0), tl.program_id(axis=1)
+    seed = tl.load(seed_ptr)
+
+    v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
+    mask = v < V
+
+    logits = tl.load(
+        logits_ptr + b_idx * stride_lb + v, mask=mask, other=float("-inf")
+    ).to(tl.float32)
+
+    u = tl.rand(seed, b_idx * V + v)  # ~U(0, 1)
+    u = tl.clamp(u, 1e-10, 1.0 - 1e-7)
+    logits = logits + tau * -tl.log(-tl.log(u))
+    best, idx = tl.max(logits, axis=0, return_indices=True)
+
+    # store the winning logit and its index, from the BLOCK_V we saw
+    tl.store(partial_max_ptr + b_idx * stride_pb + pid_v, best)
+    tl.store(partial_idx_ptr + b_idx * stride_pb + pid_v, pid_v * BLOCK_V + idx)
+
+
+@triton.jit
+def combine_partial_samples_kernel(
+    partial_max_ptr,
+    partial_idx_ptr,
+    out_ptr,
+    stride_pb,
+    stride_ob,
+    NUM_BLOCKS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # grid by just B, we wanna combine all partial results from above kernel
+    b_idx = tl.program_id(axis=0)
+    n = tl.arange(0, BLOCK_N)
+    mask = n < NUM_BLOCKS
+
+    m = tl.load(partial_max_ptr + b_idx * stride_pb + n, mask=mask, other=float("-inf"))
+    _, slot = tl.max(m, axis=0, return_indices=True)
+
+    token = tl.load(partial_idx_ptr + b_idx * stride_pb + slot)
+    tl.store(out_ptr + b_idx * stride_ob, token)
+
+
+def sample(logits: torch.Tensor, tau: float, seed: torch.Tensor) -> torch.Tensor:
+    B, V = logits.shape
+    assert logits.stride(-1) == 1, "kernel assumes contiguous vocab dim"
+    BLOCK_V = 2048
+    num_blocks = triton.cdiv(V, BLOCK_V)
+    partial_max = torch.empty(B, num_blocks, device=logits.device, dtype=torch.float32)
+    partial_idx = torch.empty(B, num_blocks, device=logits.device, dtype=torch.int64)
+    out = torch.empty(B, 1, device=logits.device, dtype=torch.int64)
+    sampling_kernel[(B, num_blocks)](
+        seed,
+        logits,
+        partial_max,
+        partial_idx,
+        tau,
+        logits.stride(0),
+        partial_max.stride(0),
+        V=V,  # type: ignore
+        BLOCK_V=BLOCK_V,  # type: ignore
+    )
+    combine_partial_samples_kernel[(B,)](
+        partial_max,
+        partial_idx,
+        out,
+        partial_max.stride(0),
+        out.stride(0),
+        NUM_BLOCKS=num_blocks,  # type: ignore
+        BLOCK_N=triton.next_power_of_2(num_blocks),  # type: ignore
+    )
+    seed.add_(1)
+    return out

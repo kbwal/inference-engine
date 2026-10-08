@@ -6,6 +6,7 @@ import torch
 import torch.cuda.tunable as tunable
 import torch.nn.functional as F
 from run_tokenization import encode, decode
+from kernels import sample
 
 TUNABLEOP_FILE = os.path.join(os.path.dirname(__file__), "tunableop_results.csv")
 
@@ -33,19 +34,22 @@ def capture_decode_graph(
     cache_pos: torch.Tensor,
     positions: torch.Tensor,
     key_mask: torch.Tensor,
+    tau: float,
+    seed: torch.Tensor,
 ):
     static_input = next_input.clone()
     static_cache_pos = cache_pos.clone()
     static_positions = positions.clone()
 
     def run() -> torch.Tensor:
-        return model(
+        logits = model(
             static_input,
             kv_cache=kv_cache,
             cache_pos=static_cache_pos,
             positions=static_positions,
             key_mask=key_mask,
         )
+        return sample(logits, tau, seed)
 
     # warmup, this is necessary for triton autotune (and tunableop) to happen before graph capture
     s = torch.cuda.Stream()
@@ -59,9 +63,9 @@ def capture_decode_graph(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        static_logits = run()
+        static_tokens = run()
 
-    return graph, static_input, static_cache_pos, static_positions, static_logits
+    return graph, static_input, static_cache_pos, static_positions, static_tokens
 
 
 def enable_tunableop(path: str = TUNABLEOP_FILE) -> None:
@@ -116,15 +120,6 @@ def chunked_prefill(
     return torch.cat(logits)
 
 
-def sample_from_logits(logits: torch.Tensor, tau: float) -> torch.Tensor:
-    if tau == 0:
-        predicted_tokens = torch.argmax(logits, -1, keepdim=True)
-    else:
-        probs = (logits / tau).softmax(-1)
-        predicted_tokens = torch.multinomial(probs, num_samples=1)
-    return predicted_tokens
-
-
 @torch.inference_mode()
 def autoregress(
     model: Qwen3_1_7B,
@@ -167,11 +162,13 @@ def autoregress(
     key_mask = F.pad(attention_mask, (0, max_len - prompt_len), value=1).bool()
     next_input = token_ids
 
+    seed = torch.randint(0, 2**31, (1,), device=device, dtype=torch.int64)
+
     graph: torch.cuda.CUDAGraph | None = None
     static_input: torch.Tensor | None = None
     static_cache_pos: torch.Tensor | None = None
     static_positions: torch.Tensor | None = None
-    static_logits: torch.Tensor | None = None
+    static_tokens: torch.Tensor | None = None
 
     for step in range(max_new_tokens):
         if step == 0:
@@ -186,22 +183,21 @@ def autoregress(
                 key_mask=key_mask,
                 token_budget=prefill_token_budget,
             )
+            predicted_tokens = sample(logits, tau, seed)
         else:
             assert (
                 graph is not None
                 and static_input is not None
                 and static_cache_pos is not None
                 and static_positions is not None
-                and static_logits is not None
+                and static_tokens is not None
             )
             # we need to pass in the same pointers every time!
             static_input.copy_(next_input)
             static_cache_pos.copy_(cache_pos)
             static_positions.copy_(positions)
             graph.replay()
-            logits = static_logits
-
-        predicted_tokens = sample_from_logits(logits=logits, tau=tau)
+            predicted_tokens = static_tokens
 
         cache_pos = (
             cache_pos[-1:]
@@ -227,9 +223,16 @@ def autoregress(
         if step == 0:
             sync()
             t_first = time.perf_counter()
-            graph, static_input, static_cache_pos, static_positions, static_logits = (
+            graph, static_input, static_cache_pos, static_positions, static_tokens = (
                 capture_decode_graph(
-                    model, kv_cache, next_input, cache_pos, positions, key_mask
+                    model,
+                    kv_cache,
+                    next_input,
+                    cache_pos,
+                    positions,
+                    key_mask,
+                    tau,
+                    seed,
                 )
             )
             sync()
