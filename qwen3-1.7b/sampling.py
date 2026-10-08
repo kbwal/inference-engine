@@ -1,9 +1,13 @@
 from architecture import Qwen3_1_7B, AttentionLayer, LayerKVCache
+import os
 import time
 from dataclasses import dataclass
 import torch
+import torch.cuda.tunable as tunable
 import torch.nn.functional as F
 from run_tokenization import encode, decode
+
+TUNABLEOP_FILE = os.path.join(os.path.dirname(__file__), "tunableop_results.csv")
 
 
 @dataclass
@@ -43,12 +47,14 @@ def capture_decode_graph(
             key_mask=key_mask,
         )
 
-    # warmup, this is necessary for triton autotune to happen before graph capture
+    # warmup, this is necessary for triton autotune (and tunableop) to happen before graph capture
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
+    tunable.tuning_enable(tunable.is_enabled())
     with torch.cuda.stream(s):
         for _ in range(2):
             run()
+    tunable.tuning_enable(False)
     torch.cuda.current_stream().wait_stream(s)
 
     graph = torch.cuda.CUDAGraph()
@@ -56,6 +62,12 @@ def capture_decode_graph(
         static_logits = run()
 
     return graph, static_input, static_cache_pos, static_positions, static_logits
+
+
+def enable_tunableop(path: str = TUNABLEOP_FILE) -> None:
+    tunable.enable(True)
+    tunable.tuning_enable(False)
+    tunable.set_filename(path)
 
 
 def make_layer_cache(B, Hkv, max_len, D, device):

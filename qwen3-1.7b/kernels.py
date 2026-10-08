@@ -22,6 +22,7 @@ class LayerKVCache:
         for st in [2, 3]
     ],
     key=["num_batches", "max_len"],
+    cache_results=True,
 )
 @triton.jit
 def decode_attention_kernel(
@@ -58,7 +59,7 @@ def decode_attention_kernel(
     h_offsets = tl.arange(0, 16)
     h_valid = h_offsets < GQA_RATIO
 
-    # output is (B, H, 1, D), so index by (B, H)
+    # output is (B, 1, H, D), so index by (B, H)
     b_idx = tl.program_id(axis=0)  # batch
     h_idx = tl.program_id(axis=1)  # head
 
@@ -198,7 +199,7 @@ def decode_attention(
     B, Hq, T, D = q.shape
     Hkv = k_cache.shape[1]
     assert T == 1, "somehow T != 1 in the custom decode attention kernel!"
-    out = torch.empty(B, Hq, 1, D, device=q.device, dtype=q.dtype)
+    out = torch.empty(B, 1, Hq, D, device=q.device, dtype=q.dtype)
 
     # we have 82 SMs, so if B is too small then not all are used
     # use num_splits to split the work when B is low
@@ -236,7 +237,7 @@ def decode_attention(
         k_cache.stride(dim=1),
         k_cache.stride(dim=2),
         out.stride(dim=0),
-        out.stride(dim=1),
+        out.stride(dim=2),
         key_mask.stride(dim=0),
         kv_cache.k_scale.stride(dim=0),
         kv_cache.k_scale.stride(dim=1),
@@ -253,8 +254,8 @@ def decode_attention(
             partial_maxes,
             partial_running_sum,
             out,
-            out.stride(0),
-            out.stride(1),
+            out.stride(dim=0),
+            out.stride(dim=2),
             HQ=Hq,  # type: ignore
             D=D,  # type: ignore
             NUM_SPLITS=num_splits,  # type: ignore
@@ -562,3 +563,167 @@ def quantize_kv_prefill(
         D=D,  # type: ignore
         BLOCK_T=32,  # type: ignore
     )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_warps=w, num_stages=st)
+        for bm, bn, w, st in [
+            (128, 32, 4, 2),
+            (128, 32, 8, 2),
+            (128, 64, 8, 2),
+            (128, 128, 8, 2),
+            (64, 32, 4, 2),
+        ]
+    ],
+    key=["T_BUCKET"],
+    cache_results=True,
+)
+@triton.jit
+def prefill_attention_kernel(
+    q_ptr,  # bf16 [B, Hq,  T, D]
+    k_ptr,  # bf16 [B, Hkv, T, D]
+    v_ptr,  # bf16 [B, Hkv, T, D]
+    out_ptr,  # bf16 [B, T, Hq, D]
+    pad_len_ptr,  # int32 [B]
+    stride_qb,
+    stride_qh,
+    stride_qt,
+    stride_kb,
+    stride_kh,
+    stride_kt,
+    stride_vb,
+    stride_vh,
+    stride_vt,
+    stride_ob,
+    stride_ot,
+    stride_oh,
+    qk_scale,
+    T,
+    T_BUCKET,
+    GQA_RATIO: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # query rows for a program
+    BLOCK_N: tl.constexpr,  # keys per inner-loop step
+):
+    pid_m, b_idx, hq_idx = (
+        tl.program_id(axis=0),
+        tl.program_id(axis=1),
+        tl.program_id(axis=2),
+    )
+    hkv_idx = hq_idx // GQA_RATIO
+
+    d_offsets = tl.arange(0, D)
+    start_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    q_tile_mask = (start_m < T)[:, None]  # [BLOCK_M, 1]
+    Q = tl.load(
+        q_ptr
+        + stride_qb * b_idx
+        + stride_qh * hq_idx
+        + start_m[:, None] * stride_qt
+        + d_offsets[None, :],
+        mask=q_tile_mask,
+    )  # [BLOCK_M, D]
+
+    pad_len = tl.load(pad_len_ptr + b_idx)
+
+    max_old = tl.full((BLOCK_M,), value=float("-inf"), dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+
+    for start_n in range(
+        (pad_len // BLOCK_N) * BLOCK_N, tl.minimum(BLOCK_M * (pid_m + 1), T), BLOCK_N
+    ):
+        n_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_tile_mask = (n_offsets < T)[:, None]  # [BLOCK_N, 1]
+
+        K = tl.load(
+            k_ptr
+            + stride_kb * b_idx
+            + stride_kh * hkv_idx
+            + n_offsets[:, None] * stride_kt
+            + d_offsets[None, :],
+            mask=k_tile_mask,
+        )  # [BLOCK_N, D]
+        in_cache = n_offsets < T  # [BLOCK_N]
+        mask = (
+            in_cache[None, :]
+            & (n_offsets >= pad_len)[None, :]
+            & (n_offsets[None, :] <= start_m[:, None])
+        )
+
+        v = tl.load(
+            v_ptr
+            + b_idx * stride_vb
+            + hkv_idx * stride_vh
+            + n_offsets[:, None] * stride_vt
+            + d_offsets[None, :],
+            mask=in_cache[:, None],
+            other=0.0,
+        )  # (BLOCK_N, D)
+
+        attn_scores = tl.dot(Q, tl.trans(K)) * qk_scale  # [BLOCK_M, BLOCK_N]
+        attn_scores = tl.where(mask, attn_scores, float("-inf"))
+
+        max_score = tl.max(attn_scores, axis=1)
+        max_new = tl.maximum(max_score, max_old)
+        safe_max_new = tl.where(max_new == float("-inf"), 0.0, max_new)
+
+        alpha = tl.exp2(max_old - safe_max_new)
+        numerator = tl.exp2(attn_scores - safe_max_new[:, None])
+        running_sum = running_sum * alpha + tl.sum(numerator, axis=1)
+
+        weighted_sum = tl.dot(numerator.to(v.dtype), v)  # (16, D)
+        accumulator = accumulator * alpha[:, None] + weighted_sum
+
+        max_old = max_new
+
+    out = tl.where(running_sum[:, None] != 0, accumulator / running_sum[:, None], 0.0)
+    tl.store(
+        out_ptr
+        + stride_ob * b_idx
+        + stride_oh * hq_idx
+        + start_m[:, None] * stride_ot
+        + d_offsets[None, :],
+        out,
+        mask=q_tile_mask,
+    )
+
+
+def prefill_attention(
+    q: torch.Tensor,  # bf16 [B, Hq, T, D]
+    k: torch.Tensor,  # bf16 [B, Hkv, T, D]
+    v: torch.Tensor,  # bf16 [B, Hkv, T, D]
+    pad_len: torch.Tensor,  # int32 [B]
+) -> torch.Tensor:  # bf16 [B, T, Hq, D]
+    B, Hq, T, D = q.shape
+    Hkv = k.shape[1]
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+    out = torch.empty(B, T, Hq, D, device=q.device, dtype=q.dtype)
+    grid = lambda meta: (triton.cdiv(T, meta["BLOCK_M"]), B, Hq)
+    prefill_attention_kernel[grid](
+        q,
+        k,
+        v,
+        out,
+        pad_len,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        D**-0.5
+        * 1.4426950408889634,  # qk_scale, log2(e) folded in for exp2. saves a PTX instruction
+        T,
+        T_BUCKET=triton.next_power_of_2(T),
+        GQA_RATIO=Hq // Hkv,
+        D=D,
+    )
+    return out

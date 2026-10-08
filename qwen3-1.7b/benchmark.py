@@ -1,5 +1,5 @@
 import torch
-from sampling import autoregress
+from sampling import autoregress, enable_tunableop
 from run_tokenization import gen_tokenizer, encode
 from architecture import make_qwen_1_7
 from load_weights import load_weights
@@ -29,6 +29,7 @@ if __name__ == "__main__":
     stop_token_id = tokenizer.eos_token_id
     assert type(stop_token_id) == int
     model.load_state_dict(load_weights(device="cuda"), assign=True)
+    enable_tunableop()
 
     MAX_NEW_TOKENS = 128
     BATCH_SIZES = [1, 4, 16, 32, 64, 128, 256, 512]

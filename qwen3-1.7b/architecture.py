@@ -6,6 +6,7 @@ from kernels import (
     decode_attention,
     fused_rope_kv_decode,
     quantize_kv_prefill,
+    prefill_attention,
 )
 
 
@@ -49,10 +50,10 @@ class AttentionLayer(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        mask: torch.Tensor,
         kv_cache: LayerKVCache,
         cache_pos: torch.Tensor,
         key_mask: torch.Tensor,
+        pad_len: torch.Tensor,
     ):
         B, T, _ = x.shape  # note: x is newly generated tokens NOT in the kv cache
         q, k, v = self.qkv_proj(x).split(
@@ -88,17 +89,9 @@ class AttentionLayer(nn.Module):
             q = self.rope(self.q_norm(q), cos=cos, sin=sin)
             k = self.rope(self.k_norm(k), cos=cos, sin=sin)
             quantize_kv_prefill(k, v, key_mask, kv_cache)
+            out = prefill_attention(q, k, v, pad_len)
 
-            out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask[..., :T],
-                is_causal=False,
-                enable_gqa=True,
-            )
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
-
+        out = out.contiguous().view(B, T, -1)
         return self.o_proj(out)
 
 
@@ -166,19 +159,19 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        mask: torch.Tensor,
         kv_cache: LayerKVCache,
         cache_pos: torch.Tensor,
         key_mask: torch.Tensor,
+        pad_len: torch.Tensor,
     ):
         x = x + self.self_attn(
             self.input_layernorm(x),
             cos=cos,
             sin=sin,
-            mask=mask,
             kv_cache=kv_cache,
             cache_pos=cache_pos,
             key_mask=key_mask,
+            pad_len=pad_len,
         )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
@@ -239,29 +232,24 @@ class Qwen3Model(nn.Module):
     ):
         assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
         x = self.embed_tokens(x)
-
-        max_len = key_mask.size(-1)
-        slots = torch.arange(max_len, device=x.device)
-        causal = slots.unsqueeze(dim=0) <= cache_pos.unsqueeze(dim=1)  # [T, max_len]
-        mask = (
-            causal[None, None, :, :] & key_mask[:, None, None, :]
-        )  # [B, 1, T, max_len]
+        T = cache_pos.shape[0]
 
         angles = (
             positions[:, None, :, None]
             * self.get_buffer("inv_freq")[None, None, None, :]
         )
         cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+        pad_len = T - key_mask[:, :T].sum(dim=1)
 
         for i, block in enumerate(self.layers):
             x = block(
                 x,
                 cos=cos,
                 sin=sin,
-                mask=mask,
                 kv_cache=kv_cache[i],
                 cache_pos=cache_pos,
                 key_mask=key_mask,
+                pad_len=pad_len,
             )
         x = self.norm(x)
         return x
