@@ -49,15 +49,18 @@ class AttentionLayer(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
+        x: torch.Tensor,  # [N, model_dim], tokens NOT already in the kv cache
+        seq_ids: torch.Tensor | None,  # [N], prefill only
+        cu_seqlens: torch.Tensor | None,  # [B + 1], prefill only (None means decode)
+        cos: torch.Tensor,  # [N, 1, head_dim // 2]
         sin: torch.Tensor,
         kv_cache: LayerKVCache,
-        cache_pos: torch.Tensor,
-        key_mask: torch.Tensor,
-        pad_len: torch.Tensor,
+        cached_lens: torch.Tensor,  # [B], tokens already in the kv cache per sequence
+        slot_ids: torch.Tensor,  # [B], kv cache row of each sequence
+        tile_start: torch.Tensor | None,  # [num_tiles], prefill only
+        prefill_block_m: int,  # the BLOCK_M tile_start was built with
     ):
-        B, T, _ = x.shape  # note: x is newly generated tokens NOT in the kv cache
+        N = x.shape[0]
         q, k, v = self.qkv_proj(x).split(
             [
                 self.head_dim * self.num_q_heads,
@@ -67,11 +70,12 @@ class AttentionLayer(nn.Module):
             dim=-1,
         )
 
-        q = q.view(B, T, self.num_q_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = q.view(N, self.num_q_heads, self.head_dim)
+        k = k.view(N, self.num_kv_heads, self.head_dim)
+        v = v.view(N, self.num_kv_heads, self.head_dim)
 
-        if T == 1:
+        if cu_seqlens is None:
+            # decode
             q = fused_rope_kv_decode(
                 q,
                 k,
@@ -80,21 +84,33 @@ class AttentionLayer(nn.Module):
                 self.k_norm.weight,
                 cos,
                 sin,
+                slot_ids,
                 kv_cache,
-                cache_pos,
+                cached_lens,
                 self.q_norm.eps,  # type: ignore
             )
             out = decode_attention(
-                q, kv_cache, key_mask, cache_pos, self.head_dim**-0.5
+                q, kv_cache, cached_lens, slot_ids, self.head_dim**-0.5
             )
         else:
+            assert seq_ids is not None and tile_start is not None
             q = self.rope(self.q_norm(q), cos=cos, sin=sin)
             k = self.rope(self.k_norm(k), cos=cos, sin=sin)
-            quantize_kv_prefill(k, v, key_mask, kv_cache)
-            out = prefill_attention(q, k, v, pad_len)
+            quantize_kv_prefill(k, v, cu_seqlens, slot_ids, cached_lens, kv_cache)
+            out = prefill_attention(
+                q,
+                k,
+                v,
+                seq_ids,
+                cached_lens,
+                cu_seqlens,
+                tile_start,
+                slot_ids,
+                kv_cache,
+                prefill_block_m,
+            )
 
-        out = out.contiguous().view(B, T, -1)
-        return self.o_proj(out)
+        return self.o_proj(out.view(N, -1))  # out is [N, Hq, head_dim]
 
 
 class MLPLayer(nn.Module):
@@ -158,12 +174,15 @@ class TransformerBlock(nn.Module):
         residual: (
             torch.Tensor | None
         ),  # if there was a previous block, this is that residual
+        seq_ids: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
         kv_cache: LayerKVCache,
-        cache_pos: torch.Tensor,
-        key_mask: torch.Tensor,
-        pad_len: torch.Tensor,
+        cached_lens: torch.Tensor,
+        slot_ids: torch.Tensor,
+        tile_start: torch.Tensor | None,
+        prefill_block_m: int,
     ):
         if residual is None:
             residual, normed = x, self.input_layernorm(x)
@@ -173,12 +192,15 @@ class TransformerBlock(nn.Module):
             )
         attn_out = self.self_attn(
             normed,
+            seq_ids,
+            cu_seqlens,
             cos=cos,
             sin=sin,
             kv_cache=kv_cache,
-            cache_pos=cache_pos,
-            key_mask=key_mask,
-            pad_len=pad_len,
+            cached_lens=cached_lens,
+            slot_ids=slot_ids,
+            tile_start=tile_start,
+            prefill_block_m=prefill_block_m,
         )
         residual, normed = add_rms_norm(
             residual,
@@ -200,10 +222,12 @@ class Qwen3Model(nn.Module):
         vocab_size: int,
         num_layers: int,
         base: int = 1000000,
+        prefill_block_m: int = 128,  # query rows per prefill attention program
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
+        self.prefill_block_m = prefill_block_m
         self.embed_tokens = nn.Embedding(
             vocab_size, model_dim, device=device, dtype=dtype
         )
@@ -236,34 +260,70 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,  # [N] token ids. prefill: all prompts packed, decode: one per sequence
         kv_cache: list[LayerKVCache],
-        cache_pos: torch.Tensor,  # [T], cache slots to write into
-        positions: torch.Tensor,  # [B, T], RoPE
-        key_mask: torch.Tensor,  # [B, max_len] False for padding
+        cu_seqlens: torch.Tensor | None = None,  # [B + 1], prefill only
+        cached_lens: (
+            torch.Tensor | None
+        ) = None,  # [B], tokens already in the kv cache per sequence. required for decode, defaults to 0 for prefill
+        slot_ids: torch.Tensor | None = None,  # [B], kv cache row of each sequence
     ):
-        assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
-        x = self.embed_tokens(x)
-        T = cache_pos.shape[0]
+        assert x.ndim == 1, "expected a flat [N] tensor of token ids"
+        assert (
+            cu_seqlens is not None or cached_lens is not None
+        ), "decode needs cached_lens"
+        assert slot_ids is not None, "pass slot_ids for both prefill and decode"
+        N = x.shape[0]
+        x = self.embed_tokens(x)  # [N, model_dim]
+
+        seq_ids = tile_start = None
+        if cu_seqlens is not None:
+            # prefill
+            chunk_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            seq_ids = torch.repeat_interleave(
+                input=torch.arange(chunk_lens.shape[0], device=x.device),
+                repeats=chunk_lens,
+                output_size=N,
+            )
+            if cached_lens is None:  # prefilling from scratch, nothing cached yet
+                cached_lens = torch.zeros_like(chunk_lens)
+            # a chunk continues after whatever is already cached
+            positions = (
+                cached_lens[seq_ids]
+                + torch.arange(N, device=x.device)
+                - cu_seqlens[seq_ids]
+            )
+            # first packed row of each prefill attention program. every sequence starts
+            # on a fresh tile, so no tile holds rows from two sequences
+            starts, row = [], 0
+            for L in chunk_lens.tolist():
+                starts.extend(range(row, row + L, self.prefill_block_m))
+                row += L
+            tile_start = torch.tensor(starts, device=x.device, dtype=torch.int32)
+        else:
+            # decode: the new token's position is the number of tokens before it
+            assert cached_lens is not None
+            positions = cached_lens
 
         angles = (
-            positions[:, None, :, None]
-            * self.get_buffer("inv_freq")[None, None, None, :]
-        )
+            positions[:, None, None] * self.get_buffer("inv_freq")[None, None, :]
+        )  # [N, 1, head_dim // 2], broadcasts over heads
         cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
-        pad_len = T - key_mask[:, :T].sum(dim=1)
 
         residual = None
         for i, block in enumerate(self.layers):
             x, residual = block(
                 x,
                 residual,
+                seq_ids,
+                cu_seqlens,
                 cos=cos,
                 sin=sin,
                 kv_cache=kv_cache[i],
-                cache_pos=cache_pos,
-                key_mask=key_mask,
-                pad_len=pad_len,
+                cached_lens=cached_lens,
+                slot_ids=slot_ids,
+                tile_start=tile_start,
+                prefill_block_m=self.prefill_block_m,
             )
         _, x = add_rms_norm(residual, x, self.norm.weight, self.norm.eps)  # type: ignore
         return x
@@ -280,6 +340,7 @@ class Qwen3_1_7B(nn.Module):
         vocab_size: int,
         num_layers: int,
         tie_word_embeddings: bool = True,
+        prefill_block_m: int = 128,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -293,6 +354,7 @@ class Qwen3_1_7B(nn.Module):
             num_kv_heads=num_kv_heads,
             vocab_size=vocab_size,
             num_layers=num_layers,
+            prefill_block_m=prefill_block_m,
             device=device,
             dtype=dtype,
         )
@@ -304,21 +366,22 @@ class Qwen3_1_7B(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
-        cache_pos: torch.Tensor,  # [T], cache slots to write into
-        positions: torch.Tensor,  # [B, T], RoPE
-        key_mask: torch.Tensor,  # [B, max_len] False for padding
-    ):  # returns logits
-        assert x.ndim == 2, "expected input of shape (batch_size, seq_len)"
+        x: torch.Tensor,  # [N] token ids
+        kv_cache: list[LayerKVCache],
+        cu_seqlens: torch.Tensor | None = None,  # [B + 1], prefill only
+        cached_lens: torch.Tensor | None = None,  # [B], tokens already cached. decode: required, prefill: default 0
+        slot_ids: torch.Tensor | None = None,  # [B], kv cache row of each sequence
+    ):  # returns logits [B, vocab]
         x = self.model(
             x,
             kv_cache=kv_cache,
-            cache_pos=cache_pos,
-            positions=positions,
-            key_mask=key_mask,
+            cu_seqlens=cu_seqlens,
+            cached_lens=cached_lens,
+            slot_ids=slot_ids,
         )
-        x = x[:, -1, :]
+        if cu_seqlens is not None:
+            x = x[cu_seqlens[1:] - 1]  # prefill
+        # decode, already last
         w = (
             self.model.embed_tokens.weight
             if self.lm_head is None
@@ -330,6 +393,7 @@ class Qwen3_1_7B(nn.Module):
 def make_qwen_1_7(
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
+    prefill_block_m: int = 128,
 ):
     model_dim = 2048
     mlp_intermediate_dim = 6144
@@ -348,6 +412,7 @@ def make_qwen_1_7(
         vocab_size=vocab_size,
         num_layers=num_layers,
         tie_word_embeddings=tie_word_embeddings,
+        prefill_block_m=prefill_block_m,
         device=device,
         dtype=dtype,
     )

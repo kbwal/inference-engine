@@ -7,11 +7,12 @@ from dataclasses import dataclass
 
 @dataclass
 class LayerKVCache:
-    k: torch.Tensor  # int8  [B, Hkv, max_len, D]
-    v: torch.Tensor  # int8  [B, Hkv, max_len, D]
-    k_scale: torch.Tensor  # fp32  [B, Hkv, max_len]
-    v_scale: torch.Tensor  # fp32  [B, Hkv, max_len]
-    k_calibration: torch.Tensor  # fp32  [B, Hkv, 1, D]
+    # leading dim is the slot pool, not the batch: sequence b lives in row slot_ids[b]
+    k: torch.Tensor  # int8  [pool, Hkv, max_len, D]
+    v: torch.Tensor  # int8  [pool, Hkv, max_len, D]
+    k_scale: torch.Tensor  # fp32  [pool, Hkv, max_len]
+    v_scale: torch.Tensor  # fp32  [pool, Hkv, max_len]
+    k_calibration: torch.Tensor  # fp32  [pool, Hkv, 1, D]
 
 
 @triton.autotune(
@@ -32,11 +33,11 @@ def decode_attention_kernel(
     output_ptr,
     k_scale_ptr,
     v_scale_ptr,
-    key_mask_ptr,
-    cache_pos_ptr,
+    cached_lens_ptr,
     partial_accumulation_ptr,
     partial_max_ptr,
     partial_running_sum_ptr,
+    slot_ids_ptr,
     stride_qb,
     stride_qh,
     stride_kb,
@@ -44,7 +45,6 @@ def decode_attention_kernel(
     stride_kn,
     stride_ob,
     stride_oh,
-    stride_mb,
     stride_sb,
     stride_sh,
     scale,
@@ -59,9 +59,10 @@ def decode_attention_kernel(
     h_offsets = tl.arange(0, 16)
     h_valid = h_offsets < GQA_RATIO
 
-    # output is (B, 1, H, D), so index by (B, H)
+    # output is (B, H, D), so index by (B, H)
     b_idx = tl.program_id(axis=0)  # batch
     h_idx = tl.program_id(axis=1)  # head
+    slot = tl.load(slot_ids_ptr + b_idx)
 
     q = tl.load(
         q_ptr
@@ -72,15 +73,15 @@ def decode_attention_kernel(
         other=0.0,
     )  # (16, D), last 14 are 0s. this makes it use more compute, but this kernel is memory bound
 
-    cache_pos = tl.load(cache_pos_ptr)  # [1]
-    n_end = cache_pos + 1
+    cached_len = tl.load(cached_lens_ptr + b_idx)  # [1]
+    n_end = cached_len + 1
 
     split_idx = tl.program_id(axis=2)
     split_len = tl.cdiv(tl.cdiv(n_end, NUM_SPLITS), BLOCK_N) * BLOCK_N
     split_start = split_idx * split_len
     split_end = tl.minimum(split_start + split_len, n_end)
 
-    kv_bh_offsets = b_idx * stride_kb + h_idx * stride_kh
+    kv_bh_offsets = slot * stride_kb + h_idx * stride_kh
 
     max_old = tl.full((16,), value=float("-inf"), dtype=tl.float32)
     running_sum = tl.zeros((16,), dtype=tl.float32)
@@ -102,21 +103,14 @@ def decode_attention_kernel(
             tl.bfloat16
         )  # (BLOCK_N, D)
 
-        scale_offsets = b_idx * stride_sb + h_idx * stride_sh + n_offsets
+        scale_offsets = slot * stride_sb + h_idx * stride_sh + n_offsets
         k_s = tl.load(
             k_scale_ptr + scale_offsets, mask=in_cache, other=0.0
         )  # [BLOCK_N]
         v_s = tl.load(v_scale_ptr + scale_offsets, mask=in_cache, other=0.0)
 
-        key_mask_offsets = b_idx * stride_mb + n_offsets
-        key_mask = tl.load(key_mask_ptr + key_mask_offsets, mask=in_cache, other=False)[
-            None, :
-        ]  # [1, BLOCK_N]
-
-        mask = in_cache[None, :] & key_mask  # [1, BLOCK_N]
-
         attn_scores = tl.dot(q, tl.trans(k)) * (k_s * scale)[None, :]  # [16, BLOCK_N]
-        attn_scores = tl.where(mask, attn_scores, float("-inf"))
+        attn_scores = tl.where(in_cache[None, :], attn_scores, float("-inf"))
 
         max_score = tl.max(attn_scores, axis=1)
         max_new = tl.maximum(max_score, max_old)
@@ -138,7 +132,7 @@ def decode_attention_kernel(
         tl.store(
             output_ptr
             + b_idx * stride_ob
-            + (h_idx * GQA_RATIO + h_offsets)[:, None] * stride_oh
+            + q_heads[:, None] * stride_oh
             + d_offsets[None, :],
             out,
             mask=h_valid[:, None],
@@ -189,17 +183,18 @@ def decode_attention_combine_kernel(
 
 
 def decode_attention(
-    q: torch.Tensor,
+    q: torch.Tensor,  # [B, Hq, D], one new token per sequence
     kv_cache: LayerKVCache,
-    key_mask: torch.Tensor,
-    cache_pos: torch.Tensor,
+    cached_lens: torch.Tensor,  # [B], tokens already cached per sequence
+    slot_ids: torch.Tensor,  # [B], kv cache row of each sequence
     scale,
-):
+):  # -> [B, Hq, D]
     k_cache, v_cache = kv_cache.k, kv_cache.v
-    B, Hq, T, D = q.shape
+    assert k_cache.stride() == v_cache.stride(), "kernel uses one set of strides for k and v"
+    assert kv_cache.k_scale.stride() == kv_cache.v_scale.stride()
+    B, Hq, D = q.shape
     Hkv = k_cache.shape[1]
-    assert T == 1, "somehow T != 1 in the custom decode attention kernel!"
-    out = torch.empty(B, 1, Hq, D, device=q.device, dtype=q.dtype)
+    out = torch.empty(B, Hq, D, device=q.device, dtype=q.dtype)
 
     # we have 82 SMs, so if B is too small then not all are used
     # use num_splits to split the work when B is low
@@ -226,19 +221,18 @@ def decode_attention(
         out,
         kv_cache.k_scale,
         kv_cache.v_scale,
-        key_mask,
-        cache_pos,
+        cached_lens,
         partial_accumulator,
         partial_maxes,
         partial_running_sum,
+        slot_ids,
         q.stride(dim=0),
         q.stride(dim=1),
         k_cache.stride(dim=0),
         k_cache.stride(dim=1),
         k_cache.stride(dim=2),
         out.stride(dim=0),
-        out.stride(dim=2),
-        key_mask.stride(dim=0),
+        out.stride(dim=1),
         kv_cache.k_scale.stride(dim=0),
         kv_cache.k_scale.stride(dim=1),
         scale,
@@ -255,7 +249,7 @@ def decode_attention(
             partial_running_sum,
             out,
             out.stride(dim=0),
-            out.stride(dim=2),
+            out.stride(dim=1),
             HQ=Hq,  # type: ignore
             D=D,  # type: ignore
             NUM_SPLITS=num_splits,  # type: ignore
@@ -271,7 +265,7 @@ def fused_rope_kv_decode_kernel(
     q_norm_ptr,
     k_norm_ptr,
     output_ptr,
-    cache_pos_ptr,
+    cached_lens_ptr,
     k_cache_ptr,
     v_cache_ptr,
     k_scale_ptr,
@@ -279,6 +273,7 @@ def fused_rope_kv_decode_kernel(
     k_calibration_ptr,
     cos_ptr,
     sin_ptr,
+    slot_ids_ptr,
     stride_qb,
     stride_qh,
     stride_kb,
@@ -332,34 +327,36 @@ def fused_rope_kv_decode_kernel(
     out1 = x1 * cos - x2 * sin  # [D // 2]
     out2 = x1 * sin + x2 * cos
 
+    slot = tl.load(slot_ids_ptr + b_idx)
+
     if h_idx < HQ:
         # fold channel scale into q: (q * c) * (k / c) == q * k
-        c_off = b_idx * stride_calb + (h_idx // GQA_RATIO) * stride_calh
-        c1 = tl.load(k_calibration_ptr + c_off + half_d_offsets)
-        c2 = tl.load(k_calibration_ptr + c_off + D // 2 + half_d_offsets)
+        calibration_offset = slot * stride_calb + (h_idx // GQA_RATIO) * stride_calh
+        c1 = tl.load(k_calibration_ptr + calibration_offset + half_d_offsets)
+        c2 = tl.load(k_calibration_ptr + calibration_offset + D // 2 + half_d_offsets)
         o = output_ptr + stride_ob * b_idx + stride_oh * h_idx
         tl.store(o + half_d_offsets, out1 * c1)
         tl.store(o + D // 2 + half_d_offsets, out2 * c2)
     else:
         j = h_idx - HQ
-        pos = tl.load(cache_pos_ptr)
+        cached_len = tl.load(cached_lens_ptr + b_idx)
         d_offsets = tl.arange(0, D)
-        slot = (
-            b_idx * stride_cb + j * stride_ch + pos * stride_cn
-        )  # same strides for k_cache and v_cache
-        scale_slot = b_idx * stride_sb + j * stride_sh + pos
+        scale_slot = slot * stride_sb + j * stride_sh + cached_len
 
-        c_off = b_idx * stride_calb + j * stride_calh
-        k1 = out1 / tl.load(k_calibration_ptr + c_off + half_d_offsets)
-        k2 = out2 / tl.load(k_calibration_ptr + c_off + D // 2 + half_d_offsets)
+        calibration_offset = slot * stride_calb + j * stride_calh
+        cache_offset = slot * stride_cb + j * stride_ch + cached_len * stride_cn
+        k1 = out1 / tl.load(k_calibration_ptr + calibration_offset + half_d_offsets)
+        k2 = out2 / tl.load(
+            k_calibration_ptr + calibration_offset + D // 2 + half_d_offsets
+        )
         k_amax = tl.maximum(tl.max(tl.abs(k1), axis=0), tl.max(tl.abs(k2), axis=0))
         k_s = tl.maximum(k_amax, 1e-6) / 127
         tl.store(
-            k_cache_ptr + slot + half_d_offsets,
+            k_cache_ptr + cache_offset + half_d_offsets,
             tl.clamp(libdevice.rint(k1 / k_s), -127.0, 127.0).to(tl.int8),
         )
         tl.store(
-            k_cache_ptr + slot + D // 2 + half_d_offsets,
+            k_cache_ptr + cache_offset + D // 2 + half_d_offsets,
             tl.clamp(libdevice.rint(k2 / k_s), -127.0, 127.0).to(tl.int8),
         )
         tl.store(k_scale_ptr + scale_slot, k_s)
@@ -369,32 +366,33 @@ def fused_rope_kv_decode_kernel(
         )
         v_s = tl.maximum(tl.max(tl.abs(v), axis=0), 1e-6) / 127
         tl.store(
-            v_cache_ptr + slot + d_offsets,
+            v_cache_ptr + cache_offset + d_offsets,
             tl.clamp(libdevice.rint(v / v_s), -127.0, 127.0).to(tl.int8),
         )
         tl.store(v_scale_ptr + scale_slot, v_s)
 
 
 def fused_rope_kv_decode(
-    q: torch.Tensor,  # (B, Hq, 1, D)
-    k: torch.Tensor,  # (B, Hkv, 1, D)
+    q: torch.Tensor,  # (B, Hq, D), one new token per sequence
+    k: torch.Tensor,  # (B, Hkv, D)
     v: torch.Tensor,
     q_norm_weight: torch.Tensor,  # (D,)
     k_norm_weight: torch.Tensor,
-    cos: torch.Tensor,  # (B, 1, 1, D // 2)
+    cos: torch.Tensor,  # (B, 1, D // 2)
     sin: torch.Tensor,
+    slot_ids: torch.Tensor,  # [B], list of ints that points to the row holding this sequence's cache
     kv_cache: LayerKVCache,
-    cache_pos: torch.Tensor,
+    cached_lens: torch.Tensor,  # [B], tokens already in the kv cache per sequence
     eps: float,
 ):
     # returns normed + roped q and writes kv cache
-    B, Hq, T, D = q.shape
+    B, Hq, D = q.shape
     Hkv = k.shape[1]
-    assert T == 1, "somehow T != 1 in the custom fused rope kernel!"
     assert (
         kv_cache.k.stride() == kv_cache.v.stride()
     ), "kernel uses one set of strides for both caches"
-    out = torch.empty(B, Hq, 1, D, device=q.device, dtype=q.dtype)
+    assert kv_cache.k_scale.stride() == kv_cache.v_scale.stride()
+    out = torch.empty(B, Hq, D, device=q.device, dtype=q.dtype)
     fused_rope_kv_decode_kernel[(B, Hq + Hkv)](
         q,
         k,
@@ -402,7 +400,7 @@ def fused_rope_kv_decode(
         q_norm_weight,
         k_norm_weight,
         out,
-        cache_pos,
+        cached_lens,
         kv_cache.k,
         kv_cache.v,
         kv_cache.k_scale,
@@ -410,6 +408,7 @@ def fused_rope_kv_decode(
         kv_cache.k_calibration,
         cos,
         sin,
+        slot_ids,
         q.stride(0),
         q.stride(1),
         k.stride(0),
@@ -437,22 +436,20 @@ def fused_rope_kv_decode(
 
 @triton.jit
 def quantize_kv_prefill_kernel(
-    k_ptr,  # # bf16 [B, Hkv, T, D]
-    v_ptr,
-    key_mask_ptr,  # bool [B, max_len]
-    k_cache_ptr,  # int8 [B, Hkv, max_len, D]
-    v_cache_ptr,
-    k_scale_ptr,  # fp32 [B, Hkv, max_len]
-    v_scale_ptr,
-    k_calibration_ptr,  # fp32 [B, Hkv, 1, D]
-    T,
-    stride_kb,
+    k_ptr,  # bf16 [N, Hkv, D], all sequences packed along N
+    v_ptr,  # bf16 [N, Hkv, D]
+    k_cache_ptr,  # int8 [pool, Hkv, max_len, D], sequence b writes row slot_ids[b] from column cached_lens[b]
+    v_cache_ptr,  # int8 [pool, Hkv, max_len, D]
+    k_scale_ptr,  # fp32 [pool, Hkv, max_len]
+    v_scale_ptr,  # fp32 [pool, Hkv, max_len]
+    k_calibration_ptr,  # fp32 [pool, Hkv, 1, D], computed on a sequence's first chunk only
+    cu_seqlens_ptr,  # int32 [B + 1], sequence i is packed tokens [cu_seqlens[i], cu_seqlens[i+1])
+    slot_ids_ptr,
+    cached_lens_ptr,
     stride_kh,
     stride_kt,
-    stride_vb,
     stride_vh,
     stride_vt,
-    stride_mb,
     stride_cb,
     stride_ch,
     stride_cn,
@@ -460,38 +457,49 @@ def quantize_kv_prefill_kernel(
     stride_sh,
     stride_calb,
     stride_calh,
+    stride_cuseqb,
     D: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     b_idx = tl.program_id(axis=0)
     h_idx = tl.program_id(axis=1)
+    slot = tl.load(slot_ids_ptr + b_idx)
     d_offsets = tl.arange(0, D)
-    k_base = k_ptr + b_idx * stride_kb + h_idx * stride_kh
-    v_base = v_ptr + b_idx * stride_vb + h_idx * stride_vh
 
-    calibration = tl.full((D,), 1e-3, dtype=tl.float32)
-    for t0 in range(0, T, BLOCK_T):
-        t_offsets = t0 + tl.arange(0, BLOCK_T)
-        in_t = t_offsets < T
-        valid = in_t & tl.load(
-            key_mask_ptr + b_idx * stride_mb + t_offsets, mask=in_t, other=False
+    seq_start = tl.load(cu_seqlens_ptr + b_idx * stride_cuseqb)
+    # how many tokens am i writing?
+    chunk_len = tl.load(cu_seqlens_ptr + (b_idx + 1) * stride_cuseqb) - seq_start
+    # how many tokens do i already have?
+    cached_len = tl.load(cached_lens_ptr + b_idx)
+
+    k_base = k_ptr + stride_kt * seq_start + h_idx * stride_kh
+    v_base = v_ptr + stride_vt * seq_start + h_idx * stride_vh
+
+    if cached_len == 0:
+        calibration = tl.full((D,), 1e-3, dtype=tl.float32)
+        for t0 in range(0, chunk_len, BLOCK_T):
+            t_offsets = t0 + tl.arange(0, BLOCK_T)
+            in_t = t_offsets < chunk_len
+            k = tl.load(
+                k_base + t_offsets[:, None] * stride_kt + d_offsets[None, :],
+                mask=in_t[:, None],
+                other=0.0,
+            ).to(
+                tl.float32
+            )  # (BLOCK_T, D)
+            calibration = tl.maximum(calibration, tl.max(tl.abs(k), axis=0))
+        tl.store(
+            k_calibration_ptr + slot * stride_calb + h_idx * stride_calh + d_offsets,
+            calibration,
         )
-        k = tl.load(
-            k_base + t_offsets[:, None] * stride_kt + d_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(
-            tl.float32
-        )  # (BLOCK_T, D)
-        calibration = tl.maximum(calibration, tl.max(tl.abs(k), axis=0))
-    tl.store(
-        k_calibration_ptr + b_idx * stride_calb + h_idx * stride_calh + d_offsets,
-        calibration,
-    )
+    else:
+        calibration = tl.load(
+            k_calibration_ptr + slot * stride_calb + h_idx * stride_calh + d_offsets
+        )
 
-    for t0 in range(0, T, BLOCK_T):
+    for t0 in range(0, chunk_len, BLOCK_T):
         t_offsets = t0 + tl.arange(0, BLOCK_T)
-        in_t = t_offsets < T
+        in_t = t_offsets < chunk_len
 
         k = (
             tl.load(
@@ -517,42 +525,45 @@ def quantize_kv_prefill_kernel(
         )
 
         cache_offsets = (
-            b_idx * stride_cb
+            slot * stride_cb
             + h_idx * stride_ch
-            + t_offsets[:, None] * stride_cn
+            + (cached_len + t_offsets[:, None]) * stride_cn
             + d_offsets[None, :]
         )
         tl.store(k_cache_ptr + cache_offsets, k_quantized, mask=in_t[:, None])
         tl.store(v_cache_ptr + cache_offsets, v_quantized, mask=in_t[:, None])
-        scale_offsets = b_idx * stride_sb + h_idx * stride_sh + t_offsets
+        scale_offsets = slot * stride_sb + h_idx * stride_sh + cached_len + t_offsets
         tl.store(k_scale_ptr + scale_offsets, k_scale, mask=in_t)
         tl.store(v_scale_ptr + scale_offsets, v_scale, mask=in_t)
 
 
 def quantize_kv_prefill(
-    k: torch.Tensor, v: torch.Tensor, key_mask: torch.Tensor, cache: LayerKVCache
+    k: torch.Tensor,  # bf16 [N, Hkv, D], all sequences packed along N
+    v: torch.Tensor,  # bf16 [N, Hkv, D]
+    cu_seqlens: torch.Tensor,  # int32 [B + 1]
+    slot_ids: torch.Tensor,  # [B], sequence i is written to cache row slot_ids[i]
+    cached_lens: torch.Tensor,  # [B], new tokens are written starting at this column
+    cache: LayerKVCache,
 ):
-    B, Hkv, T, D = k.shape
+    N, Hkv, D = k.shape
     assert k.stride(-1) == 1 and v.stride(-1) == 1, "kernel assumes contiguous head_dim"
     assert cache.k.stride() == cache.v.stride()
     assert cache.k_scale.stride() == cache.v_scale.stride()
-    quantize_kv_prefill_kernel[(B, Hkv)](
+    quantize_kv_prefill_kernel[(cu_seqlens.shape[0] - 1, Hkv)](
         k,
         v,
-        key_mask,
         cache.k,
         cache.v,
         cache.k_scale,
         cache.v_scale,
         cache.k_calibration,
-        T,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
+        cu_seqlens,
+        slot_ids,
+        cached_lens,
+        k.stride(1),  # head
+        k.stride(0),  # token
         v.stride(1),
-        v.stride(2),
-        key_mask.stride(0),
+        v.stride(0),
         cache.k.stride(0),
         cache.k.stride(1),
         cache.k.stride(2),
@@ -560,6 +571,7 @@ def quantize_kv_prefill(
         cache.k_scale.stride(1),
         cache.k_calibration.stride(0),
         cache.k_calibration.stride(1),
+        cu_seqlens.stride(0),
         D=D,  # type: ignore
         BLOCK_T=32,  # type: ignore
     )
@@ -567,13 +579,12 @@ def quantize_kv_prefill(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_warps=w, num_stages=st)
-        for bm, bn, w, st in [
-            (128, 32, 4, 2),
-            (128, 32, 8, 2),
-            (128, 64, 8, 2),
-            (128, 128, 8, 2),
-            (64, 32, 4, 2),
+        triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=st)
+        for bn, w, st in [
+            (32, 4, 2),
+            (32, 8, 2),
+            (64, 8, 2),
+            (128, 8, 2),
         ]
     ],
     key=["T_BUCKET"],
@@ -581,84 +592,160 @@ def quantize_kv_prefill(
 )
 @triton.jit
 def prefill_attention_kernel(
-    q_ptr,  # bf16 [B, Hq,  T, D]
-    k_ptr,  # bf16 [B, Hkv, T, D]
-    v_ptr,  # bf16 [B, Hkv, T, D]
-    out_ptr,  # bf16 [B, T, Hq, D]
-    pad_len_ptr,  # int32 [B]
-    stride_qb,
+    q_ptr,  # bf16 [N, Hq,  D], all sequences packed along N
+    k_ptr,  # bf16 [N, Hkv, D]
+    v_ptr,  # bf16 [N, Hkv, D]
+    out_ptr,  # bf16 [N, Hq, D]
+    seq_ids_ptr,  # [N] which sequence each packed token belongs to
+    cached_lens_ptr,  # [B], for every sequence: how many tokens have already been prefilled? 0 for pure prefill
+    tile_start_ptr,
+    cu_seqlens_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_calibration_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    slot_ids_ptr,
     stride_qh,
-    stride_qt,
-    stride_kb,
+    stride_qn,
     stride_kh,
-    stride_kt,
-    stride_vb,
+    stride_kn,
     stride_vh,
-    stride_vt,
-    stride_ob,
-    stride_ot,
+    stride_vn,
+    stride_on,
     stride_oh,
+    stride_cachekb,
+    stride_cachekh,
+    stride_cachekn,
+    stride_cachevb,
+    stride_cachevh,
+    stride_cachevn,
+    stride_calibb,
+    stride_calibh,
+    stride_kscaleb,
+    stride_kscaleh,
+    stride_vscaleb,
+    stride_vscaleh,
     qk_scale,
-    T,
+    N,
     T_BUCKET,
     GQA_RATIO: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,  # query rows for a program
     BLOCK_N: tl.constexpr,  # keys per inner-loop step
 ):
-    pid_m, b_idx, hq_idx = (
+    tile_idx, hq_idx = (
         tl.program_id(axis=0),
         tl.program_id(axis=1),
-        tl.program_id(axis=2),
     )
     hkv_idx = hq_idx // GQA_RATIO
 
+    row_start = tl.load(tile_start_ptr + tile_idx)
+    seq = tl.load(seq_ids_ptr + row_start)
+    slot = tl.load(slot_ids_ptr + seq)
+    cached_len = tl.load(cached_lens_ptr + seq)
+    seq_start = tl.load(cu_seqlens_ptr + seq)
+    seq_end = tl.load(cu_seqlens_ptr + seq + 1)
     d_offsets = tl.arange(0, D)
-    start_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    q_tile_mask = (start_m < T)[:, None]  # [BLOCK_M, 1]
-    Q = tl.load(
-        q_ptr
-        + stride_qb * b_idx
-        + stride_qh * hq_idx
-        + start_m[:, None] * stride_qt
-        + d_offsets[None, :],
-        mask=q_tile_mask,
-    )  # [BLOCK_M, D]
 
-    pad_len = tl.load(pad_len_ptr + b_idx)
+    start_m = row_start + tl.arange(0, BLOCK_M)
+    q_seq_mask = start_m < seq_end  # [BLOCK_M]
+    Q = tl.load(
+        q_ptr + stride_qh * hq_idx + start_m[:, None] * stride_qn + d_offsets[None, :],
+        mask=q_seq_mask[:, None],
+    )  # [BLOCK_M, D]
+    k_calibration = tl.load(
+        k_calibration_ptr + slot * stride_calibb + hkv_idx * stride_calibh + d_offsets
+    )
+    Qc = (Q * k_calibration).to(tl.bfloat16)
 
     max_old = tl.full((BLOCK_M,), value=float("-inf"), dtype=tl.float32)
     running_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, D), dtype=tl.float32)
 
-    for start_n in range(
-        (pad_len // BLOCK_N) * BLOCK_N, tl.minimum(BLOCK_M * (pid_m + 1), T), BLOCK_N
-    ):
-        n_offsets = start_n + tl.arange(0, BLOCK_N)
-        k_tile_mask = (n_offsets < T)[:, None]  # [BLOCK_N, 1]
+    for i in range(0, cached_len, BLOCK_N):
+        n_offsets = i + tl.arange(0, BLOCK_N)
+        mask = n_offsets < cached_len  # [BLOCK_N]
 
         K = tl.load(
-            k_ptr
-            + stride_kb * b_idx
-            + stride_kh * hkv_idx
-            + n_offsets[:, None] * stride_kt
+            k_cache_ptr
+            + slot * stride_cachekb
+            + hkv_idx * stride_cachekh
+            + n_offsets[:, None] * stride_cachekn
             + d_offsets[None, :],
-            mask=k_tile_mask,
+            mask=mask[:, None],
+        ).to(
+            tl.bfloat16
         )  # [BLOCK_N, D]
-        in_cache = n_offsets < T  # [BLOCK_N]
-        mask = (
-            in_cache[None, :]
-            & (n_offsets >= pad_len)[None, :]
-            & (n_offsets[None, :] <= start_m[:, None])
+
+        k_scale = tl.load(
+            k_scale_ptr + slot * stride_kscaleb + hkv_idx * stride_kscaleh + n_offsets,
+            mask=mask,
+            other=0.0,
         )
 
         v = tl.load(
-            v_ptr
-            + b_idx * stride_vb
-            + hkv_idx * stride_vh
-            + n_offsets[:, None] * stride_vt
+            v_cache_ptr
+            + slot * stride_cachevb
+            + hkv_idx * stride_cachevh
+            + n_offsets[:, None] * stride_cachevn
             + d_offsets[None, :],
-            mask=in_cache[:, None],
+            mask=mask[:, None],
+            other=0.0,
+        ).to(
+            tl.bfloat16
+        )  # (BLOCK_N, D)
+
+        v_scale = tl.load(
+            v_scale_ptr + slot * stride_vscaleb + hkv_idx * stride_vscaleh + n_offsets,
+            mask=mask,
+            other=0.0,
+        )
+
+        attn_scores = (
+            tl.dot(Qc, tl.trans(K)) * k_scale[None, :] * qk_scale
+        )  # [BLOCK_M, BLOCK_N]
+        attn_scores = tl.where(mask, attn_scores, float("-inf"))
+
+        max_score = tl.max(attn_scores, axis=1)
+        max_new = tl.maximum(max_score, max_old)
+        safe_max_new = tl.where(max_new == float("-inf"), 0.0, max_new)
+
+        alpha = tl.exp2(max_old - safe_max_new)
+        numerator = tl.exp2(attn_scores - safe_max_new[:, None])
+        running_sum = running_sum * alpha + tl.sum(numerator, axis=1)
+
+        weighted_sum = tl.dot((numerator * v_scale[None, :]).to(v.dtype), v)  # (BLOCK_M, D)
+        accumulator = accumulator * alpha[:, None] + weighted_sum
+
+        max_old = max_new
+
+    for start_n in range(
+        seq_start,
+        tl.minimum(row_start + BLOCK_M, seq_end),
+        BLOCK_N,
+    ):
+        n_offsets = start_n + tl.arange(0, BLOCK_N)
+        # bounding by N (not seq_end) is fine: the causal mask below already hides
+        # any key past this tile's last row, so keys of the next sequence never count
+        in_bounds = n_offsets < N  # [BLOCK_N]
+        k_tile_mask = in_bounds[:, None]  # [BLOCK_N, 1]
+
+        K = tl.load(
+            k_ptr
+            + stride_kh * hkv_idx
+            + n_offsets[:, None] * stride_kn
+            + d_offsets[None, :],
+            mask=k_tile_mask,
+        )  # [BLOCK_N, D]
+        mask = in_bounds[None, :] & (n_offsets[None, :] <= start_m[:, None])
+
+        v = tl.load(
+            v_ptr
+            + hkv_idx * stride_vh
+            + n_offsets[:, None] * stride_vn
+            + d_offsets[None, :],
+            mask=in_bounds[:, None],
             other=0.0,
         )  # (BLOCK_N, D)
 
@@ -673,7 +760,7 @@ def prefill_attention_kernel(
         numerator = tl.exp2(attn_scores - safe_max_new[:, None])
         running_sum = running_sum * alpha + tl.sum(numerator, axis=1)
 
-        weighted_sum = tl.dot(numerator.to(v.dtype), v)  # (16, D)
+        weighted_sum = tl.dot(numerator.to(v.dtype), v)  # (BLOCK_M, D)
         accumulator = accumulator * alpha[:, None] + weighted_sum
 
         max_old = max_new
@@ -681,50 +768,72 @@ def prefill_attention_kernel(
     out = tl.where(running_sum[:, None] != 0, accumulator / running_sum[:, None], 0.0)
     tl.store(
         out_ptr
-        + stride_ob * b_idx
         + stride_oh * hq_idx
-        + start_m[:, None] * stride_ot
+        + start_m[:, None] * stride_on
         + d_offsets[None, :],
         out,
-        mask=q_tile_mask,
+        mask=q_seq_mask[:, None],
     )
 
 
 def prefill_attention(
-    q: torch.Tensor,  # bf16 [B, Hq, T, D]
-    k: torch.Tensor,  # bf16 [B, Hkv, T, D]
-    v: torch.Tensor,  # bf16 [B, Hkv, T, D]
-    pad_len: torch.Tensor,  # int32 [B]
-) -> torch.Tensor:  # bf16 [B, T, Hq, D]
-    B, Hq, T, D = q.shape
+    q: torch.Tensor,  # bf16 [N, Hq, D], all sequences packed along N
+    k: torch.Tensor,  # bf16 [N, Hkv, D]
+    v: torch.Tensor,  # bf16 [N, Hkv, D]
+    seq_ids: torch.Tensor,  # [N] which sequence each packed token belongs to
+    cached_lens: torch.Tensor,  # [B] int32, tokens already in the cache per sequence
+    cu_seqlens: torch.Tensor,  # [B + 1] int32
+    tile_start: torch.Tensor,  # [num_tiles] int32, first packed row of each tile, built with PREFILL_BLOCK_M
+    slot_ids: torch.Tensor,  # [B] int32, kv cache row of each sequence
+    kv_cache: LayerKVCache,
+    PREFILL_BLOCK_M: int,  # must be the same value tile_start was built with
+) -> torch.Tensor:  # bf16 [N, Hq, D]
+    N, Hq, D = q.shape
     Hkv = k.shape[1]
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
-    out = torch.empty(B, T, Hq, D, device=q.device, dtype=q.dtype)
-    grid = lambda meta: (triton.cdiv(T, meta["BLOCK_M"]), B, Hq)
-    prefill_attention_kernel[grid](
+    out = torch.empty(N, Hq, D, device=q.device, dtype=q.dtype)
+    prefill_attention_kernel[(tile_start.shape[0], Hq)](
         q,
         k,
         v,
         out,
-        pad_len,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
+        seq_ids,
+        cached_lens,
+        tile_start,
+        cu_seqlens,
+        kv_cache.k,
+        kv_cache.v,
+        kv_cache.k_calibration,
+        kv_cache.k_scale,
+        kv_cache.v_scale,
+        slot_ids,
+        q.stride(1),  # head
+        q.stride(0),  # token
         k.stride(1),
-        k.stride(2),
-        v.stride(0),
+        k.stride(0),
         v.stride(1),
-        v.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
+        v.stride(0),
+        out.stride(0),  # token
+        out.stride(1),  # head
+        kv_cache.k.stride(0),
+        kv_cache.k.stride(1),
+        kv_cache.k.stride(2),
+        kv_cache.v.stride(0),
+        kv_cache.v.stride(1),
+        kv_cache.v.stride(2),
+        kv_cache.k_calibration.stride(0),
+        kv_cache.k_calibration.stride(1),
+        kv_cache.k_scale.stride(0),
+        kv_cache.k_scale.stride(1),
+        kv_cache.v_scale.stride(0),
+        kv_cache.v_scale.stride(1),
         D**-0.5
         * 1.4426950408889634,  # qk_scale, log2(e) folded in for exp2. saves a PTX instruction
-        T,
-        T_BUCKET=triton.next_power_of_2(T),
+        N,
+        T_BUCKET=triton.next_power_of_2(N),
         GQA_RATIO=Hq // Hkv,
         D=D,
+        BLOCK_M=PREFILL_BLOCK_M,
     )
     return out
 
@@ -738,7 +847,7 @@ def silu_mul_kernel(
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    # [B, T, D] -> B & T squashed into one dim, so [N, D]
+    # [N, 2D] -> [N, D], one program per (token, BLOCK_D columns)
     row, pid_d = tl.program_id(axis=0), tl.program_id(axis=1)
     d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask = d_offsets < D
@@ -755,16 +864,15 @@ def silu_mul_kernel(
     )
 
 
-def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
-    B, T, two_d = gate_up.shape
+def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:  # [N, 2D] -> [N, D]
+    N, two_d = gate_up.shape
     D = two_d // 2
-    x = gate_up.view(-1, two_d)
-    out = torch.empty(x.shape[0], D, device=x.device, dtype=x.dtype)
+    out = torch.empty(N, D, device=gate_up.device, dtype=gate_up.dtype)
     BLOCK_D = 1024
-    silu_mul_kernel[(x.shape[0], triton.cdiv(D, BLOCK_D))](
-        x, out, x.stride(0), out.stride(0), D, BLOCK_D=BLOCK_D  # type: ignore
+    silu_mul_kernel[(N, triton.cdiv(D, BLOCK_D))](
+        gate_up, out, gate_up.stride(0), out.stride(0), D, BLOCK_D=BLOCK_D  # type: ignore
     )
-    return out.view(B, T, D)
+    return out
 
 
 @triton.jit
@@ -782,7 +890,7 @@ def add_rms_norm_kernel(
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    # residual stream & delta is [B, T, D] -> merge into [N, D]
+    # residual stream & delta are [N, D], one program per token
     row = tl.program_id(axis=0)
     d_offsets = tl.arange(0, BLOCK_D)
     mask = d_offsets < D
@@ -815,14 +923,13 @@ def add_rms_norm_kernel(
 
 def add_rms_norm(
     residual: torch.Tensor, delta: torch.Tensor, rms_norm: torch.Tensor, eps: float
-):
-    B, T, D = residual.shape
-    residual = residual.view(B * T, D)
-    delta = delta.view(B * T, D)
+):  # residual, delta: [N, D]
+    N, D = residual.shape
+    assert residual.stride(-1) == 1 and delta.stride(-1) == 1
     new_residual = torch.empty_like(residual)
     new_normed_residual = torch.empty_like(residual)
     BLOCK_D = triton.next_power_of_2(D)
-    add_rms_norm_kernel[(B * T,)](
+    add_rms_norm_kernel[(N,)](
         residual,
         delta,
         rms_norm,
@@ -836,7 +943,7 @@ def add_rms_norm(
         D=D,  # type: ignore
         BLOCK_D=BLOCK_D,  # type: ignore
     )
-    return new_residual.view(B, T, D), new_normed_residual.view(B, T, D)
+    return new_residual, new_normed_residual
 
 
 @triton.jit
