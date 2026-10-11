@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 import torch.cuda.tunable as tunable
+from torch.cuda import nvtx
 from kernels import sample
 from collections import deque
 
@@ -100,105 +101,112 @@ class Engine:
 
     @torch.inference_mode()
     def step(self) -> list[Request]:
-        budget = self.max_tokens_per_step
-        # plan for this singular step
-        plan: list[tuple[Request, list]] = []
+        with nvtx.range("plan"):
+            budget = self.max_tokens_per_step
+            # plan for this singular step
+            plan: list[tuple[Request, list]] = []
 
-        for running_request in self.currently_processing_list:
-            if running_request.cached_len >= len(running_request.prompt_ids):
-                # it's decoding now, don't starve these, and they come at the beginning for continuity
-                plan.append((running_request, [running_request.output[-1]]))
-                budget -= 1
-        for running_request in self.currently_processing_list:
-            if (
-                running_request.cached_len < len(running_request.prompt_ids)
-                and budget > 0
-            ):
-                # prefilling
-                n = min(
-                    len(running_request.prompt_ids) - running_request.cached_len, budget
-                )
-                plan.append(
-                    (
-                        running_request,
-                        running_request.prompt_ids[
-                            running_request.cached_len : running_request.cached_len + n
-                        ],
+            for running_request in self.currently_processing_list:
+                if running_request.cached_len >= len(running_request.prompt_ids):
+                    # it's decoding now, don't starve these, and they come at the beginning for continuity
+                    plan.append((running_request, [running_request.output[-1]]))
+                    budget -= 1
+            for running_request in self.currently_processing_list:
+                if (
+                    running_request.cached_len < len(running_request.prompt_ids)
+                    and budget > 0
+                ):
+                    # prefilling
+                    n = min(
+                        len(running_request.prompt_ids) - running_request.cached_len, budget
                     )
-                )
+                    plan.append(
+                        (
+                            running_request,
+                            running_request.prompt_ids[
+                                running_request.cached_len : running_request.cached_len + n
+                            ],
+                        )
+                    )
+                    budget -= n
+
+            while self.waiting_queue and self.free_slots and budget > 0:
+                new_request_to_admit = self.waiting_queue[0]
+                n = min(len(new_request_to_admit.prompt_ids), budget)
+                if n < min(len(new_request_to_admit.prompt_ids), self.min_first_chunk):
+                    # break not continue for first come first serve
+                    break
+                req = self.waiting_queue.popleft()
+                slot_to_alloc = self.free_slots.pop()
+                req.slot = slot_to_alloc
+                self.currently_processing_list.append(req)
+                plan.append((req, req.prompt_ids[:n]))
                 budget -= n
 
-        while self.waiting_queue and self.free_slots and budget > 0:
-            new_request_to_admit = self.waiting_queue[0]
-            n = min(len(new_request_to_admit.prompt_ids), budget)
-            if n < min(len(new_request_to_admit.prompt_ids), self.min_first_chunk):
-                # break not continue for first come first serve
-                break
-            req = self.waiting_queue.popleft()
-            slot_to_alloc = self.free_slots.pop()
-            req.slot = slot_to_alloc
-            self.currently_processing_list.append(req)
-            plan.append((req, req.prompt_ids[:n]))
-            budget -= n
+            if not plan:
+                return []
 
-        if not plan:
-            return []
-
-        decode_only = all(
-            len(toks) == 1 and req.cached_len >= len(req.prompt_ids)
-            for req, toks in plan
-        )
+            decode_only = all(
+                len(toks) == 1 and req.cached_len >= len(req.prompt_ids)
+                for req, toks in plan
+            )
         if self.graphs and decode_only:
             tokens = self.replay_decode_graph(plan)
         else:
-            ids = (
-                torch.tensor([tok for _, toks in plan for tok in toks])
-                .to(torch.int64)
-                .to(self.device)
-            )
-            cu_seqlens = F.pad(
-                torch.tensor([len(toks) for _, toks in plan])
-                .cumsum(dim=0)
-                .to(torch.int32)
-                .to(self.device),
-                (1, 0),
-            )
-            cached_lens = (
-                torch.tensor([r.cached_len for r, _ in plan])
-                .to(torch.int32)
-                .to(self.device)
-            )
-            slot_ids = (
-                torch.tensor([r.slot for r, _ in plan]).to(torch.int32).to(self.device)
-            )
-            logits = self.model(
-                ids,
-                self.kv_cache,
-                cu_seqlens=cu_seqlens,
-                cached_lens=cached_lens,
-                slot_ids=slot_ids,
-            )
-            tokens: list[int] = sample(logits, self.tau, self.seed).view(-1).tolist()
+            with nvtx.range("inputs"):
+                ids = (
+                    torch.tensor([tok for _, toks in plan for tok in toks])
+                    .to(torch.int64)
+                    .to(self.device)
+                )
+                cu_seqlens = F.pad(
+                    torch.tensor([len(toks) for _, toks in plan])
+                    .cumsum(dim=0)
+                    .to(torch.int32)
+                    .to(self.device),
+                    (1, 0),
+                )
+                cached_lens = (
+                    torch.tensor([r.cached_len for r, _ in plan])
+                    .to(torch.int32)
+                    .to(self.device)
+                )
+                slot_ids = (
+                    torch.tensor([r.slot for r, _ in plan]).to(torch.int32).to(self.device)
+                )
+            with nvtx.range("forward"):
+                logits = self.model(
+                    ids,
+                    self.kv_cache,
+                    cu_seqlens=cu_seqlens,
+                    cached_lens=cached_lens,
+                    slot_ids=slot_ids,
+                )
+            with nvtx.range("sample"):
+                sampled = sample(logits, self.tau, self.seed)
+            with nvtx.range("readback"):
+                tokens: list[int] = sampled.view(-1).tolist()
 
-        now = time.perf_counter()
-        finished: list[Request] = []
-        for (req, toks), tok in zip(plan, tokens):
-            req.cached_len += len(toks)
-            if req.cached_len >= len(req.prompt_ids):
-                req.output.append(tok)
-                if len(req.output) == 1:
-                    req.t_first_token = now
-                if (
-                    tok == self.stop_token_id
-                    or len(req.output) >= req.max_new_tokens
-                    or req.cached_len + 1 >= self.max_len
-                ):
-                    self.free_slots.append(req.slot)  # type: ignore
-                    self.currently_processing_list.remove(req)
-                    req.slot = None
-                    req.t_finish = now
-                    finished.append(req)
-        return finished
+        with nvtx.range("bookkeeping"):
+            now = time.perf_counter()
+            finished: list[Request] = []
+            for (req, toks), tok in zip(plan, tokens):
+                req.cached_len += len(toks)
+                if req.cached_len >= len(req.prompt_ids):
+                    req.output.append(tok)
+                    if len(req.output) == 1:
+                        req.t_first_token = now
+                    if (
+                        tok == self.stop_token_id
+                        or len(req.output) >= req.max_new_tokens
+                        or req.cached_len + 1 >= self.max_len
+                    ):
+                        self.free_slots.append(req.slot)  # type: ignore
+                        self.currently_processing_list.remove(req)
+                        req.slot = None
+                        req.t_finish = now
+                        finished.append(req)
+            return finished
 
     @torch.inference_mode()
     def capture_decode_graphs(self) -> None:
@@ -249,16 +257,19 @@ class Engine:
         b = next(x for x in self.graph_buckets if x >= B)
         pad = b - B
 
-        ids = [toks[0] for _, toks in plan] + [0] * pad
-        cached_lens = [req.cached_len for req, _ in plan] + [0] * pad
-        slot_ids = [req.slot for req, _ in plan] + [self.scratch_slot] * pad
+        with nvtx.range("inputs"):
+            ids = [toks[0] for _, toks in plan] + [0] * pad
+            cached_lens = [req.cached_len for req, _ in plan] + [0] * pad
+            slot_ids = [req.slot for req, _ in plan] + [self.scratch_slot] * pad
 
-        self.graph_ids[:b].copy_(torch.tensor(ids, dtype=torch.int64))
-        self.graph_cached_lens[:b].copy_(torch.tensor(cached_lens, dtype=torch.int32))
-        self.graph_slot_ids[:b].copy_(torch.tensor(slot_ids, dtype=torch.int32))
-        graph, tokens = self.graphs[b]
-        graph.replay()
-        return tokens[:B].view(-1).tolist()
+            self.graph_ids[:b].copy_(torch.tensor(ids, dtype=torch.int64))
+            self.graph_cached_lens[:b].copy_(torch.tensor(cached_lens, dtype=torch.int32))
+            self.graph_slot_ids[:b].copy_(torch.tensor(slot_ids, dtype=torch.int32))
+        with nvtx.range("forward"):
+            graph, tokens = self.graphs[b]
+            graph.replay()
+        with nvtx.range("readback"):
+            return tokens[:B].view(-1).tolist()
 
     def make_layer_cache(self) -> LayerKVCache:
         # one kv cache row per slot, each long enough for a whole request, plus the scratch row

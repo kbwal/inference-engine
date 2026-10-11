@@ -53,7 +53,8 @@ def decode_attention_kernel(
     GQA_RATIO: tl.constexpr,
     D: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
+    CHUNK: tl.constexpr,
+    MAX_SPLITS: tl.constexpr,
 ):
     d_offsets = tl.arange(0, D)
     h_offsets = tl.arange(0, 16)
@@ -77,9 +78,9 @@ def decode_attention_kernel(
     n_end = cached_len + 1
 
     split_idx = tl.program_id(axis=2)
-    split_len = tl.cdiv(tl.cdiv(n_end, NUM_SPLITS), BLOCK_N) * BLOCK_N
-    split_start = split_idx * split_len
-    split_end = tl.minimum(split_start + split_len, n_end)
+    split_start = split_idx * CHUNK
+    split_end = tl.minimum(split_start + CHUNK, n_end)
+    needed = tl.cdiv(n_end, CHUNK)
 
     kv_bh_offsets = slot * stride_kb + h_idx * stride_kh
 
@@ -127,7 +128,7 @@ def decode_attention_kernel(
 
     q_heads = h_idx * GQA_RATIO + h_offsets
 
-    if NUM_SPLITS == 1:
+    if needed == 1 and split_idx == 0:
         out = accumulator / running_sum[:, None]
         tl.store(
             output_ptr
@@ -137,10 +138,10 @@ def decode_attention_kernel(
             out,
             mask=h_valid[:, None],
         )
-    else:
+    elif needed > 1 and split_idx < needed:
         # we only saw a small slice, so we can't store the entire softmax in out
         HQ = tl.num_programs(axis=1) * GQA_RATIO
-        rows = (b_idx * HQ + q_heads) * NUM_SPLITS + split_idx  # (16)
+        rows = (b_idx * HQ + q_heads) * MAX_SPLITS + split_idx  # (16)
         tl.store(
             partial_accumulation_ptr + rows[:, None] * D + d_offsets[None, :],
             accumulator,
@@ -156,22 +157,30 @@ def decode_attention_combine_kernel(
     partial_max_ptr,
     partial_running_sum_ptr,
     output_ptr,
+    cached_lens_ptr,
     stride_ob,
     stride_oh,
     HQ: tl.constexpr,
     D: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
+    CHUNK: tl.constexpr,
+    MAX_SPLITS: tl.constexpr,
 ):
     b_idx = tl.program_id(axis=0)
     q_head = tl.program_id(axis=1)
-    s = tl.arange(0, NUM_SPLITS)
+    s = tl.arange(0, MAX_SPLITS)
     d_offsets = tl.arange(0, D)
-    rows = (b_idx * HQ + q_head) * NUM_SPLITS + s
+    rows = (b_idx * HQ + q_head) * MAX_SPLITS + s
 
-    maxs = tl.load(partial_max_ptr + rows)  # (S)
-    running_sum = tl.load(partial_running_sum_ptr + rows)  # (S)
+    cached_len = tl.load(cached_lens_ptr + b_idx)
+    needed = tl.cdiv(cached_len + 1, CHUNK)
+    valid = s < needed
+
+    maxs = tl.load(partial_max_ptr + rows, mask=valid, other=float("-inf"))  # (S)
+    running_sum = tl.load(partial_running_sum_ptr + rows, mask=valid, other=0)  # (S)
     accumulator = tl.load(
-        partial_accumulator_ptr + rows[:, None] * D + d_offsets[None, :]
+        partial_accumulator_ptr + rows[:, None] * D + d_offsets[None, :],
+        mask=valid[:, None],
+        other=0,
     )  # (S, D)
 
     max_score = tl.max(maxs, axis=0)
@@ -179,7 +188,11 @@ def decode_attention_combine_kernel(
     out = tl.sum(accumulator * numerator[:, None], axis=0) / tl.sum(
         running_sum * numerator, axis=0
     )  # type: ignore
-    tl.store(output_ptr + b_idx * stride_ob + q_head * stride_oh + d_offsets, out)
+    tl.store(
+        output_ptr + b_idx * stride_ob + q_head * stride_oh + d_offsets,
+        out,
+        mask=needed > 1,
+    )
 
 
 def decode_attention(
@@ -190,31 +203,26 @@ def decode_attention(
     scale,
 ):  # -> [B, Hq, D]
     k_cache, v_cache = kv_cache.k, kv_cache.v
-    assert k_cache.stride() == v_cache.stride(), "kernel uses one set of strides for k and v"
+    assert (
+        k_cache.stride() == v_cache.stride()
+    ), "kernel uses one set of strides for k and v"
     assert kv_cache.k_scale.stride() == kv_cache.v_scale.stride()
     B, Hq, D = q.shape
     Hkv = k_cache.shape[1]
     out = torch.empty(B, Hq, D, device=q.device, dtype=q.dtype)
 
-    # we have 82 SMs, so if B is too small then not all are used
-    # use num_splits to split the work when B is low
-    num_splits = min(16, triton.next_power_of_2(max(1, 128 // (B * Hkv))))
-    if num_splits > 1:
-        partial_accumulator = torch.empty(
-            B, Hq, num_splits, D, device=q.device, dtype=torch.float32
-        )
-        partial_maxes = torch.empty(
-            B, Hq, num_splits, device=q.device, dtype=torch.float32
-        )
-        partial_running_sum = torch.empty(
-            B, Hq, num_splits, device=q.device, dtype=torch.float32
-        )
-    else:
-        partial_accumulator = partial_maxes = partial_running_sum = (
-            out  # unused, triton just needs a tensor
-        )
+    chunk_size = 512  # how many tokens per program?
+    max_len = k_cache.size(2)
+    max_splits = triton.next_power_of_2(triton.cdiv(max_len, chunk_size))
+    partial_accumulator = torch.empty(
+        B, Hq, max_splits, D, device=q.device, dtype=torch.float32
+    )
+    partial_maxes = torch.empty(B, Hq, max_splits, device=q.device, dtype=torch.float32)
+    partial_running_sum = torch.empty(
+        B, Hq, max_splits, device=q.device, dtype=torch.float32
+    )
 
-    decode_attention_kernel[(B, Hkv, num_splits)](
+    decode_attention_kernel[(B, Hkv, max_splits)](
         q,
         k_cache,
         v_cache,
@@ -240,20 +248,22 @@ def decode_attention(
         max_len=triton.next_power_of_2(k_cache.shape[2]),
         GQA_RATIO=Hq // Hkv,
         D=D,
-        NUM_SPLITS=num_splits,
+        CHUNK=chunk_size,
+        MAX_SPLITS=max_splits,
     )
-    if num_splits > 1:
-        decode_attention_combine_kernel[(B, Hq)](
-            partial_accumulator,
-            partial_maxes,
-            partial_running_sum,
-            out,
-            out.stride(dim=0),
-            out.stride(dim=1),
-            HQ=Hq,  # type: ignore
-            D=D,  # type: ignore
-            NUM_SPLITS=num_splits,  # type: ignore
-        )
+    decode_attention_combine_kernel[(B, Hq)](
+        partial_accumulator,
+        partial_maxes,
+        partial_running_sum,
+        out,
+        cached_lens,
+        out.stride(dim=0),
+        out.stride(dim=1),
+        HQ=Hq,  # type: ignore
+        D=D,  # type: ignore
+        CHUNK=chunk_size,  # type: ignore
+        MAX_SPLITS=max_splits,  # type: ignore
+    )
     return out
 
 
@@ -715,7 +725,9 @@ def prefill_attention_kernel(
         numerator = tl.exp2(attn_scores - safe_max_new[:, None])
         running_sum = running_sum * alpha + tl.sum(numerator, axis=1)
 
-        weighted_sum = tl.dot((numerator * v_scale[None, :]).to(v.dtype), v)  # (BLOCK_M, D)
+        weighted_sum = tl.dot(
+            (numerator * v_scale[None, :]).to(v.dtype), v
+        )  # (BLOCK_M, D)
         accumulator = accumulator * alpha[:, None] + weighted_sum
 
         max_old = max_new

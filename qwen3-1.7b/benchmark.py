@@ -243,7 +243,8 @@ def serve(engine: Engine, work, arrivals: list[float]):
             graph = is_graph_step(engine)
             batch = len(engine.currently_processing_list)
             t = time.perf_counter()
-            engine.step()  # ends with a .tolist(), so the gpu work is done when it returns
+            with torch.cuda.nvtx.range(f"step {"graph" if graph else "eager"}"):
+                engine.step()  # ends with a .tolist(), so the gpu work is done when it returns
             steps.append((graph, batch, time.perf_counter() - t))
         elif i < len(work):
             time.sleep(max(0.0, arrivals[i] - (time.perf_counter() - start)))
@@ -291,7 +292,9 @@ def bench_serve(model, prompts: Prompts, args) -> None:
     )
     for rate in args.rates:
         arrivals = poisson_arrivals(len(work), rate, args.seed + 1)
+        torch.cuda.profiler.start()
         reqs, elapsed, steps = serve(engine, work, arrivals)
+        torch.cuda.profiler.stop()
 
         ttfts = [r.t_first_token - r.t_submit for r in reqs]  # type: ignore
         tpots = [tpot(r) for r in reqs]

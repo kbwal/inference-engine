@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda import nvtx
 from kernels import (
     LayerKVCache,
     decode_attention,
@@ -61,14 +62,15 @@ class AttentionLayer(nn.Module):
         prefill_block_m: int,  # the BLOCK_M tile_start was built with
     ):
         N = x.shape[0]
-        q, k, v = self.qkv_proj(x).split(
-            [
-                self.head_dim * self.num_q_heads,
-                self.head_dim * self.num_kv_heads,
-                self.head_dim * self.num_kv_heads,
-            ],
-            dim=-1,
-        )
+        with nvtx.range("qkv_proj"):
+            q, k, v = self.qkv_proj(x).split(
+                [
+                    self.head_dim * self.num_q_heads,
+                    self.head_dim * self.num_kv_heads,
+                    self.head_dim * self.num_kv_heads,
+                ],
+                dim=-1,
+            )
 
         q = q.view(N, self.num_q_heads, self.head_dim)
         k = k.view(N, self.num_kv_heads, self.head_dim)
@@ -76,41 +78,47 @@ class AttentionLayer(nn.Module):
 
         if cu_seqlens is None:
             # decode
-            q = fused_rope_kv_decode(
-                q,
-                k,
-                v,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                cos,
-                sin,
-                slot_ids,
-                kv_cache,
-                cached_lens,
-                self.q_norm.eps,  # type: ignore
-            )
-            out = decode_attention(
-                q, kv_cache, cached_lens, slot_ids, self.head_dim**-0.5
-            )
+            with nvtx.range("rope_kv_write"):
+                q = fused_rope_kv_decode(
+                    q,
+                    k,
+                    v,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos,
+                    sin,
+                    slot_ids,
+                    kv_cache,
+                    cached_lens,
+                    self.q_norm.eps,  # type: ignore
+                )
+            with nvtx.range("decode_attention"):
+                out = decode_attention(
+                    q, kv_cache, cached_lens, slot_ids, self.head_dim**-0.5
+                )
         else:
             assert seq_ids is not None and tile_start is not None
-            q = self.rope(self.q_norm(q), cos=cos, sin=sin)
-            k = self.rope(self.k_norm(k), cos=cos, sin=sin)
-            quantize_kv_prefill(k, v, cu_seqlens, slot_ids, cached_lens, kv_cache)
-            out = prefill_attention(
-                q,
-                k,
-                v,
-                seq_ids,
-                cached_lens,
-                cu_seqlens,
-                tile_start,
-                slot_ids,
-                kv_cache,
-                prefill_block_m,
-            )
+            with nvtx.range("norm_rope"):
+                q = self.rope(self.q_norm(q), cos=cos, sin=sin)
+                k = self.rope(self.k_norm(k), cos=cos, sin=sin)
+            with nvtx.range("kv_write"):
+                quantize_kv_prefill(k, v, cu_seqlens, slot_ids, cached_lens, kv_cache)
+            with nvtx.range("prefill_attention"):
+                out = prefill_attention(
+                    q,
+                    k,
+                    v,
+                    seq_ids,
+                    cached_lens,
+                    cu_seqlens,
+                    tile_start,
+                    slot_ids,
+                    kv_cache,
+                    prefill_block_m,
+                )
 
-        return self.o_proj(out.view(N, -1))  # out is [N, Hq, head_dim]
+        with nvtx.range("o_proj"):
+            return self.o_proj(out.view(N, -1))  # out is [N, Hq, head_dim]
 
 
 class MLPLayer(nn.Module):
@@ -184,31 +192,33 @@ class TransformerBlock(nn.Module):
         tile_start: torch.Tensor | None,
         prefill_block_m: int,
     ):
-        if residual is None:
-            residual, normed = x, self.input_layernorm(x)
-        else:
-            residual, normed = add_rms_norm(
-                residual, x, self.input_layernorm.weight, self.input_layernorm.eps  # type: ignore
+        with nvtx.range("attn"):
+            if residual is None:
+                residual, normed = x, self.input_layernorm(x)
+            else:
+                residual, normed = add_rms_norm(
+                    residual, x, self.input_layernorm.weight, self.input_layernorm.eps  # type: ignore
+                )
+            attn_out = self.self_attn(
+                normed,
+                seq_ids,
+                cu_seqlens,
+                cos=cos,
+                sin=sin,
+                kv_cache=kv_cache,
+                cached_lens=cached_lens,
+                slot_ids=slot_ids,
+                tile_start=tile_start,
+                prefill_block_m=prefill_block_m,
             )
-        attn_out = self.self_attn(
-            normed,
-            seq_ids,
-            cu_seqlens,
-            cos=cos,
-            sin=sin,
-            kv_cache=kv_cache,
-            cached_lens=cached_lens,
-            slot_ids=slot_ids,
-            tile_start=tile_start,
-            prefill_block_m=prefill_block_m,
-        )
-        residual, normed = add_rms_norm(
-            residual,
-            attn_out,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.eps,  # type: ignore
-        )
-        return self.mlp(normed), residual
+        with nvtx.range("mlp"):
+            residual, normed = add_rms_norm(
+                residual,
+                attn_out,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,  # type: ignore
+            )
+            return self.mlp(normed), residual
 
 
 class Qwen3Model(nn.Module):
@@ -274,58 +284,63 @@ class Qwen3Model(nn.Module):
         ), "decode needs cached_lens"
         assert slot_ids is not None, "pass slot_ids for both prefill and decode"
         N = x.shape[0]
-        x = self.embed_tokens(x)  # [N, model_dim]
+        with nvtx.range("embed"):
+            x = self.embed_tokens(x)  # [N, model_dim]
 
         seq_ids = tile_start = None
-        if cu_seqlens is not None:
-            # prefill
-            chunk_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            seq_ids = torch.repeat_interleave(
-                input=torch.arange(chunk_lens.shape[0], device=x.device),
-                repeats=chunk_lens,
-                output_size=N,
-            )
-            if cached_lens is None:  # prefilling from scratch, nothing cached yet
-                cached_lens = torch.zeros_like(chunk_lens)
-            # a chunk continues after whatever is already cached
-            positions = (
-                cached_lens[seq_ids]
-                + torch.arange(N, device=x.device)
-                - cu_seqlens[seq_ids]
-            )
-            # first packed row of each prefill attention program. every sequence starts
-            # on a fresh tile, so no tile holds rows from two sequences
-            starts, row = [], 0
-            for L in chunk_lens.tolist():
-                starts.extend(range(row, row + L, self.prefill_block_m))
-                row += L
-            tile_start = torch.tensor(starts, device=x.device, dtype=torch.int32)
-        else:
-            # decode: the new token's position is the number of tokens before it
-            assert cached_lens is not None
-            positions = cached_lens
+        with nvtx.range("metadata"):
+            if cu_seqlens is not None:
+                # prefill
+                chunk_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                seq_ids = torch.repeat_interleave(
+                    input=torch.arange(chunk_lens.shape[0], device=x.device),
+                    repeats=chunk_lens,
+                    output_size=N,
+                )
+                if cached_lens is None:  # prefilling from scratch, nothing cached yet
+                    cached_lens = torch.zeros_like(chunk_lens)
+                # a chunk continues after whatever is already cached
+                positions = (
+                    cached_lens[seq_ids]
+                    + torch.arange(N, device=x.device)
+                    - cu_seqlens[seq_ids]
+                )
+                # first packed row of each prefill attention program. every sequence starts
+                # on a fresh tile, so no tile holds rows from two sequences
+                starts, row = [], 0
+                for L in chunk_lens.tolist():
+                    starts.extend(range(row, row + L, self.prefill_block_m))
+                    row += L
+                tile_start = torch.tensor(starts, device=x.device, dtype=torch.int32)
+            else:
+                # decode: the new token's position is the number of tokens before it
+                assert cached_lens is not None
+                positions = cached_lens
 
-        angles = (
-            positions[:, None, None] * self.get_buffer("inv_freq")[None, None, :]
-        )  # [N, 1, head_dim // 2], broadcasts over heads
-        cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+            angles = (
+                positions[:, None, None] * self.get_buffer("inv_freq")[None, None, :]
+            )  # [N, 1, head_dim // 2], broadcasts over heads
+            cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
 
         residual = None
         for i, block in enumerate(self.layers):
-            x, residual = block(
-                x,
-                residual,
-                seq_ids,
-                cu_seqlens,
-                cos=cos,
-                sin=sin,
-                kv_cache=kv_cache[i],
-                cached_lens=cached_lens,
-                slot_ids=slot_ids,
-                tile_start=tile_start,
-                prefill_block_m=self.prefill_block_m,
-            )
-        _, x = add_rms_norm(residual, x, self.norm.weight, self.norm.eps)  # type: ignore
+            # same name for every layer, so nsys stats aggregates them into one row
+            with nvtx.range("layer"):
+                x, residual = block(
+                    x,
+                    residual,
+                    seq_ids,
+                    cu_seqlens,
+                    cos=cos,
+                    sin=sin,
+                    kv_cache=kv_cache[i],
+                    cached_lens=cached_lens,
+                    slot_ids=slot_ids,
+                    tile_start=tile_start,
+                    prefill_block_m=self.prefill_block_m,
+                )
+        with nvtx.range("final_norm"):
+            _, x = add_rms_norm(residual, x, self.norm.weight, self.norm.eps)  # type: ignore
         return x
 
 
@@ -379,15 +394,16 @@ class Qwen3_1_7B(nn.Module):
             cached_lens=cached_lens,
             slot_ids=slot_ids,
         )
-        if cu_seqlens is not None:
-            x = x[cu_seqlens[1:] - 1]  # prefill
-        # decode, already last
-        w = (
-            self.model.embed_tokens.weight
-            if self.lm_head is None
-            else self.lm_head.weight
-        )
-        return F.linear(x, w)
+        with nvtx.range("lm_head"):
+            if cu_seqlens is not None:
+                x = x[cu_seqlens[1:] - 1]  # prefill
+            # decode, already last
+            w = (
+                self.model.embed_tokens.weight
+                if self.lm_head is None
+                else self.lm_head.weight
+            )
+            return F.linear(x, w)
 
 
 def make_qwen_1_7(
