@@ -102,6 +102,7 @@ class Engine:
     @torch.inference_mode()
     def step(self) -> list[Request]:
         with nvtx.range("plan"):
+            num_seqs_decoding = 0
             budget = self.max_tokens_per_step
             # plan for this singular step
             plan: list[tuple[Request, list]] = []
@@ -111,6 +112,7 @@ class Engine:
                     # it's decoding now, don't starve these, and they come at the beginning for continuity
                     plan.append((running_request, [running_request.output[-1]]))
                     budget -= 1
+                    num_seqs_decoding += 1
             for running_request in self.currently_processing_list:
                 if (
                     running_request.cached_len < len(running_request.prompt_ids)
@@ -118,13 +120,15 @@ class Engine:
                 ):
                     # prefilling
                     n = min(
-                        len(running_request.prompt_ids) - running_request.cached_len, budget
+                        len(running_request.prompt_ids) - running_request.cached_len,
+                        budget,
                     )
                     plan.append(
                         (
                             running_request,
                             running_request.prompt_ids[
-                                running_request.cached_len : running_request.cached_len + n
+                                running_request.cached_len : running_request.cached_len
+                                + n
                             ],
                         )
                     )
@@ -172,7 +176,9 @@ class Engine:
                     .to(self.device)
                 )
                 slot_ids = (
-                    torch.tensor([r.slot for r, _ in plan]).to(torch.int32).to(self.device)
+                    torch.tensor([r.slot for r, _ in plan])
+                    .to(torch.int32)
+                    .to(self.device)
                 )
             with nvtx.range("forward"):
                 logits = self.model(
@@ -181,6 +187,7 @@ class Engine:
                     cu_seqlens=cu_seqlens,
                     cached_lens=cached_lens,
                     slot_ids=slot_ids,
+                    num_seqs_decoding=num_seqs_decoding,
                 )
             with nvtx.range("sample"):
                 sampled = sample(logits, self.tau, self.seed)
@@ -232,7 +239,11 @@ class Engine:
 
             def run() -> torch.Tensor:
                 logits = self.model(
-                    ids, self.kv_cache, cached_lens=cached_lens, slot_ids=slot_ids
+                    ids,
+                    self.kv_cache,
+                    cached_lens=cached_lens,
+                    slot_ids=slot_ids,
+                    num_seqs_decoding=slot_ids.size(0),
                 )
                 return sample(logits, self.tau, self.seed)  # [b, 1]
 
@@ -263,7 +274,9 @@ class Engine:
             slot_ids = [req.slot for req, _ in plan] + [self.scratch_slot] * pad
 
             self.graph_ids[:b].copy_(torch.tensor(ids, dtype=torch.int64))
-            self.graph_cached_lens[:b].copy_(torch.tensor(cached_lens, dtype=torch.int32))
+            self.graph_cached_lens[:b].copy_(
+                torch.tensor(cached_lens, dtype=torch.int32)
+            )
             self.graph_slot_ids[:b].copy_(torch.tensor(slot_ids, dtype=torch.int32))
         with nvtx.range("forward"):
             graph, tokens = self.graphs[b]

@@ -60,6 +60,7 @@ class AttentionLayer(nn.Module):
         slot_ids: torch.Tensor,  # [B], kv cache row of each sequence
         tile_start: torch.Tensor | None,  # [num_tiles], prefill only
         prefill_block_m: int,  # the BLOCK_M tile_start was built with
+        num_seqs_decoding: int,  # how many sequences are decoding? these should be the first n!
     ):
         N = x.shape[0]
         with nvtx.range("qkv_proj"):
@@ -77,7 +78,7 @@ class AttentionLayer(nn.Module):
         v = v.view(N, self.num_kv_heads, self.head_dim)
 
         if cu_seqlens is None:
-            # decode
+            # pure decode
             with nvtx.range("rope_kv_write"):
                 q = fused_rope_kv_decode(
                     q,
@@ -98,24 +99,55 @@ class AttentionLayer(nn.Module):
                 )
         else:
             assert seq_ids is not None and tile_start is not None
-            with nvtx.range("norm_rope"):
-                q = self.rope(self.q_norm(q), cos=cos, sin=sin)
-                k = self.rope(self.k_norm(k), cos=cos, sin=sin)
-            with nvtx.range("kv_write"):
-                quantize_kv_prefill(k, v, cu_seqlens, slot_ids, cached_lens, kv_cache)
-            with nvtx.range("prefill_attention"):
-                out = prefill_attention(
-                    q,
-                    k,
-                    v,
-                    seq_ids,
-                    cached_lens,
-                    cu_seqlens,
-                    tile_start,
-                    slot_ids,
+            q_p = self.rope(
+                self.q_norm(q[num_seqs_decoding:]),
+                cos=cos[num_seqs_decoding:],
+                sin=sin[num_seqs_decoding:],
+            )
+            k_p = self.rope(
+                self.k_norm(k[num_seqs_decoding:]),
+                cos=cos[num_seqs_decoding:],
+                sin=sin[num_seqs_decoding:],
+            )
+            quantize_kv_prefill(
+                k_p,
+                v[num_seqs_decoding:],
+                cu_seqlens[num_seqs_decoding:] - num_seqs_decoding,
+                slot_ids[num_seqs_decoding:],
+                cached_lens[num_seqs_decoding:],
+                kv_cache,
+            )
+            out = prefill_attention(
+                q_p,
+                k_p,
+                v[num_seqs_decoding:],
+                seq_ids[num_seqs_decoding:] - num_seqs_decoding,
+                cached_lens[num_seqs_decoding:],
+                cu_seqlens[num_seqs_decoding:] - num_seqs_decoding,
+                tile_start,
+                slot_ids[num_seqs_decoding:],
+                kv_cache,
+                prefill_block_m,
+            )
+
+            if num_seqs_decoding > 0:
+                q_d = fused_rope_kv_decode(
+                    q[:num_seqs_decoding],
+                    k[:num_seqs_decoding],
+                    v[:num_seqs_decoding],
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos[:num_seqs_decoding],
+                    sin[:num_seqs_decoding],
+                    slot_ids[:num_seqs_decoding],
                     kv_cache,
-                    prefill_block_m,
+                    cached_lens[:num_seqs_decoding],
+                    self.q_norm.eps,  # type: ignore
                 )
+                out_d = decode_attention(
+                    q_d, kv_cache, cached_lens, slot_ids, self.head_dim**-0.5
+                )
+                out = torch.cat((out_d, out))
 
         with nvtx.range("o_proj"):
             return self.o_proj(out.view(N, -1))  # out is [N, Hq, head_dim]
@@ -191,6 +223,7 @@ class TransformerBlock(nn.Module):
         slot_ids: torch.Tensor,
         tile_start: torch.Tensor | None,
         prefill_block_m: int,
+        num_seqs_decoding: int,
     ):
         with nvtx.range("attn"):
             if residual is None:
@@ -210,6 +243,7 @@ class TransformerBlock(nn.Module):
                 slot_ids=slot_ids,
                 tile_start=tile_start,
                 prefill_block_m=prefill_block_m,
+                num_seqs_decoding=num_seqs_decoding,
             )
         with nvtx.range("mlp"):
             residual, normed = add_rms_norm(
@@ -277,6 +311,7 @@ class Qwen3Model(nn.Module):
             torch.Tensor | None
         ) = None,  # [B], tokens already in the kv cache per sequence. required for decode, defaults to 0 for prefill
         slot_ids: torch.Tensor | None = None,  # [B], kv cache row of each sequence
+        num_seqs_decoding: int = 0,
     ):
         assert x.ndim == 1, "expected a flat [N] tensor of token ids"
         assert (
@@ -311,7 +346,14 @@ class Qwen3Model(nn.Module):
                 for L in chunk_lens.tolist():
                     starts.extend(range(row, row + L, self.prefill_block_m))
                     row += L
-                tile_start = torch.tensor(starts, device=x.device, dtype=torch.int32)
+                tile_start = (
+                    torch.tensor(
+                        starts[num_seqs_decoding:],
+                        device=x.device,
+                        dtype=torch.int32,
+                    )
+                    - num_seqs_decoding
+                )
             else:
                 # decode: the new token's position is the number of tokens before it
                 assert cached_lens is not None
@@ -338,6 +380,7 @@ class Qwen3Model(nn.Module):
                     slot_ids=slot_ids,
                     tile_start=tile_start,
                     prefill_block_m=self.prefill_block_m,
+                    num_seqs_decoding=num_seqs_decoding,
                 )
         with nvtx.range("final_norm"):
             _, x = add_rms_norm(residual, x, self.norm.weight, self.norm.eps)  # type: ignore
@@ -384,8 +427,11 @@ class Qwen3_1_7B(nn.Module):
         x: torch.Tensor,  # [N] token ids
         kv_cache: list[LayerKVCache],
         cu_seqlens: torch.Tensor | None = None,  # [B + 1], prefill only
-        cached_lens: torch.Tensor | None = None,  # [B], tokens already cached. decode: required, prefill: default 0
+        cached_lens: (
+            torch.Tensor | None
+        ) = None,  # [B], tokens already cached. decode: required, prefill: default 0
         slot_ids: torch.Tensor | None = None,  # [B], kv cache row of each sequence
+        num_seqs_decoding: int = 0,
     ):  # returns logits [B, vocab]
         x = self.model(
             x,
@@ -393,6 +439,7 @@ class Qwen3_1_7B(nn.Module):
             cu_seqlens=cu_seqlens,
             cached_lens=cached_lens,
             slot_ids=slot_ids,
+            num_seqs_decoding=num_seqs_decoding,
         )
         with nvtx.range("lm_head"):
             if cu_seqlens is not None:

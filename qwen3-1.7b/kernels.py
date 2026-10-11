@@ -3,16 +3,68 @@ import triton.language as tl
 import torch
 from triton.language.extra import libdevice
 from dataclasses import dataclass
+import functools
 
 
 @dataclass
 class LayerKVCache:
-    # leading dim is the slot pool, not the batch: sequence b lives in row slot_ids[b]
     k: torch.Tensor  # int8  [pool, Hkv, max_len, D]
     v: torch.Tensor  # int8  [pool, Hkv, max_len, D]
     k_scale: torch.Tensor  # fp32  [pool, Hkv, max_len]
     v_scale: torch.Tensor  # fp32  [pool, Hkv, max_len]
     k_calibration: torch.Tensor  # fp32  [pool, Hkv, 1, D]
+
+
+@triton.jit
+def compute_piece(
+    cached_lens_ptr,
+    batch_size,
+    BLOCK_B: tl.constexpr,
+    MIN_PIECE: tl.constexpr,
+    TARGET: tl.constexpr,
+):
+    # how many kv tokens one decode program handles this step, the same for every sequence.
+    # sized from the whole batch's tokens so that ~TARGET programs per kv head have work.
+    # the attention and combine kernels both call this, so they always agree on the splits
+    b_offsets = tl.arange(0, BLOCK_B)
+    cached_lens = tl.load(
+        cached_lens_ptr + b_offsets, mask=b_offsets < batch_size, other=-1
+    )  # masked lanes become n_end = 0, so they don't count
+    total = tl.sum(cached_lens + 1)
+    piece = tl.maximum(MIN_PIECE, tl.cdiv(total, TARGET))
+    return tl.cdiv(piece, MIN_PIECE) * MIN_PIECE  # round up to a multiple of MIN_PIECE
+
+
+@triton.jit
+def assign_work(
+    cached_lens_ptr,
+    batch_size,
+    work,  # this program's index in the work list
+    BLOCK_B: tl.constexpr,
+    MIN_PIECE: tl.constexpr,
+    TARGET: tl.constexpr,
+):
+    # the work list is every sequence's pieces laid end to end: seq 0's pieces, then seq 1's, ...
+    # find which (sequence, piece) entry `work` is. programs past the end get needed = 0
+    piece = compute_piece(cached_lens_ptr, batch_size, BLOCK_B, MIN_PIECE, TARGET)
+    b_offsets = tl.arange(0, BLOCK_B)
+    n_ends = (
+        tl.load(cached_lens_ptr + b_offsets, mask=b_offsets < batch_size, other=-1) + 1
+    )
+    splits = tl.cdiv(n_ends, piece)  # pieces per sequence, 0 for masked lanes
+    ends = tl.cumsum(splits, axis=0)  # work index one past each sequence's last piece
+    # sequences that end at or before `work` come before it, so their count is our sequence
+    b_idx = tl.sum((ends <= work).to(tl.int32))
+    valid = b_idx < batch_size
+    b_idx = tl.minimum(
+        b_idx, batch_size - 1
+    )  # keep loads in bounds for invalid programs
+    is_b = b_offsets == b_idx
+    split_idx = work - tl.sum(
+        tl.where(is_b, ends - splits, 0)
+    )  # minus our sequence's first index
+    needed = tl.where(valid, tl.sum(tl.where(is_b, splits, 0)), 0)
+    return b_idx, split_idx, needed, piece
 
 
 @triton.autotune(
@@ -22,7 +74,7 @@ class LayerKVCache:
         for w in [4, 8]
         for st in [2, 3]
     ],
-    key=["num_batches", "max_len"],
+    key=["BLOCK_B", "max_len"],
     cache_results=True,
 )
 @triton.jit
@@ -53,15 +105,19 @@ def decode_attention_kernel(
     GQA_RATIO: tl.constexpr,
     D: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    CHUNK: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    MIN_PIECE: tl.constexpr,
+    TARGET: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
 ):
     d_offsets = tl.arange(0, D)
     h_offsets = tl.arange(0, 16)
     h_valid = h_offsets < GQA_RATIO
 
-    # output is (B, H, D), so index by (B, H)
-    b_idx = tl.program_id(axis=0)  # batch
+    # axis 0 walks the work list of (sequence, piece) entries, axis 1 is the kv head
+    b_idx, split_idx, needed, piece = assign_work(
+        cached_lens_ptr, num_batches, tl.program_id(axis=0), BLOCK_B, MIN_PIECE, TARGET
+    )
     h_idx = tl.program_id(axis=1)  # head
     slot = tl.load(slot_ids_ptr + b_idx)
 
@@ -77,10 +133,12 @@ def decode_attention_kernel(
     cached_len = tl.load(cached_lens_ptr + b_idx)  # [1]
     n_end = cached_len + 1
 
-    split_idx = tl.program_id(axis=2)
-    split_start = split_idx * CHUNK
-    split_end = tl.minimum(split_start + CHUNK, n_end)
-    needed = tl.cdiv(n_end, CHUNK)
+    # this program covers tokens [split_start, split_end) of its sequence. past the end of the
+    # work list needed is 0, so the range is empty and nothing gets stored below
+    split_start = split_idx * piece
+    split_end = tl.where(
+        needed > 0, tl.minimum(split_start + piece, n_end), split_start
+    )
 
     kv_bh_offsets = slot * stride_kb + h_idx * stride_kh
 
@@ -160,9 +218,12 @@ def decode_attention_combine_kernel(
     cached_lens_ptr,
     stride_ob,
     stride_oh,
+    num_batches,
     HQ: tl.constexpr,
     D: tl.constexpr,
-    CHUNK: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    MIN_PIECE: tl.constexpr,
+    TARGET: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
 ):
     b_idx = tl.program_id(axis=0)
@@ -171,8 +232,9 @@ def decode_attention_combine_kernel(
     d_offsets = tl.arange(0, D)
     rows = (b_idx * HQ + q_head) * MAX_SPLITS + s
 
+    piece = compute_piece(cached_lens_ptr, num_batches, BLOCK_B, MIN_PIECE, TARGET)
     cached_len = tl.load(cached_lens_ptr + b_idx)
-    needed = tl.cdiv(cached_len + 1, CHUNK)
+    needed = tl.cdiv(cached_len + 1, piece)
     valid = s < needed
 
     maxs = tl.load(partial_max_ptr + rows, mask=valid, other=float("-inf"))  # (S)
@@ -195,6 +257,11 @@ def decode_attention_combine_kernel(
     )
 
 
+@functools.cache
+def num_sms(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def decode_attention(
     q: torch.Tensor,  # [B, Hq, D], one new token per sequence
     kv_cache: LayerKVCache,
@@ -211,9 +278,17 @@ def decode_attention(
     Hkv = k_cache.shape[1]
     out = torch.empty(B, Hq, D, device=q.device, dtype=q.dtype)
 
-    chunk_size = 512  # how many tokens per program?
-    max_len = k_cache.size(2)
-    max_splits = triton.next_power_of_2(triton.cdiv(max_len, chunk_size))
+    PROGRAMS_PER_SM = 4  # a memory bound kernel needs several programs per SM in flight to hide latency
+    MIN_PIECE = 64  # smallest kv piece per program. below this, writing partials costs more than the kv read
+
+    # split the batch's kv tokens into pieces so that ~PROGRAMS_PER_SM programs per SM have work,
+    # whatever the mix of lengths. TARGET is programs per kv head, and no sequence ever needs more
+    # than TARGET pieces (piece >= total / TARGET), so partial buffers of that size always fit
+    target = num_sms(q.device) * PROGRAMS_PER_SM // Hkv
+    max_splits = triton.next_power_of_2(
+        target
+    )  # partial buffer stride, a power of 2 for tl.arange
+    block_b = triton.next_power_of_2(B)
     partial_accumulator = torch.empty(
         B, Hq, max_splits, D, device=q.device, dtype=torch.float32
     )
@@ -222,7 +297,8 @@ def decode_attention(
         B, Hq, max_splits, device=q.device, dtype=torch.float32
     )
 
-    decode_attention_kernel[(B, Hkv, max_splits)](
+    # the work list holds at most target + B pieces: sum(cdiv(n_b, piece)) <= total / piece + B
+    decode_attention_kernel[(target + B, Hkv)](
         q,
         k_cache,
         v_cache,
@@ -248,7 +324,9 @@ def decode_attention(
         max_len=triton.next_power_of_2(k_cache.shape[2]),
         GQA_RATIO=Hq // Hkv,
         D=D,
-        CHUNK=chunk_size,
+        BLOCK_B=block_b,
+        MIN_PIECE=MIN_PIECE,
+        TARGET=target,
         MAX_SPLITS=max_splits,
     )
     decode_attention_combine_kernel[(B, Hq)](
@@ -259,9 +337,12 @@ def decode_attention(
         cached_lens,
         out.stride(dim=0),
         out.stride(dim=1),
+        B,
         HQ=Hq,  # type: ignore
         D=D,  # type: ignore
-        CHUNK=chunk_size,  # type: ignore
+        BLOCK_B=block_b,  # type: ignore
+        MIN_PIECE=MIN_PIECE,  # type: ignore
+        TARGET=target,  # type: ignore
         MAX_SPLITS=max_splits,  # type: ignore
     )
     return out
