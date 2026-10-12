@@ -526,6 +526,199 @@ def fused_rope_kv_decode(
 
 
 @triton.jit
+def fused_norm_rope_prefill_kernel(
+    q_ptr,  # bf16 [N, Hq, D], a view into qkv_proj's output, so rows are NOT contiguous
+    k_ptr,  # bf16 [N, Hkv, D], same
+    q_norm_ptr,  # [D]
+    k_norm_ptr,  # [D]
+    cos_ptr,  # bf16 [N, 1, D // 2], one row per packed token
+    sin_ptr,
+    q_out_ptr,  # bf16 [N, Hq, D], contiguous
+    k_out_ptr,  # bf16 [N, Hkv, D], contiguous
+    stride_qn,  # token stride of q. for qwen3-1.7b this is (16 + 2 * 8) * 128 = 4096, not 16 * 128
+    stride_qh,
+    stride_kn,
+    stride_kh,
+    stride_cosn,
+    stride_sinn,
+    stride_qon,
+    stride_qoh,
+    stride_kon,
+    stride_koh,
+    N,  # packed prefill tokens
+    eps,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_T: tl.constexpr,  # tokens per program
+):
+    # prefill version of the norm + rope half of fused_rope_kv_decode_kernel: replaces
+    # self.rope(self.q_norm(q)) and self.rope(self.k_norm(k)) in AttentionLayer.forward, about 16
+    # small kernel launches per layer, with one.
+    #
+    # grid: (cdiv(N, BLOCK_T), Hq + Hkv). one program = BLOCK_T tokens of one head. like the decode
+    # kernel, heads [0, HQ) are q heads and [HQ, HQ + Hkv) are k heads.
+    # e.g. a 124 token prompt with BLOCK_T = 32 -> 4 token blocks x 24 heads = 96 programs.
+    # program (3, 20) handles tokens 96..127 of k head 20 - 16 = 4, but only 96..123 exist.
+    #
+    # the int8 cache write (quantize_kv_prefill) stays a separate kernel: on a sequence's first chunk
+    # it needs the max over ALL of that sequence's tokens (the calibration) before it can quantize
+    # any of them, and programs here only ever see BLOCK_T tokens.
+    #
+    # TODO 1: this program's tokens and head. a [BLOCK_T] vector of token indices and a mask for
+    #         the ones past N (the last block is usually partial).
+    # TODO 2: pick q or k by head, the same if/else as the decode kernel: the input pointer +
+    #         strides, the norm weight, and where the output goes.
+    # TODO 3: load the two halves x1, x2. each is now 2D, [BLOCK_T, D // 2], not [D // 2]:
+    #         token offsets go down the rows, dim offsets across the columns.
+    # TODO 4: rms norm in fp32. one rstd PER TOKEN, so you reduce across dims (axis=1). the decode
+    #         kernel reduces axis=0 because there it's a single row. then multiply by the weight
+    #         halves, broadcast across rows.
+    # TODO 5: load cos and sin for these tokens ([BLOCK_T, D // 2], the same rows as x) and rotate:
+    #         out1 = x1 * cos - x2 * sin, out2 = x1 * sin + x2 * cos.
+    # TODO 6: store both halves to q_out or k_out, masked like the loads.
+    n_idx, h_idx = tl.program_id(0), tl.program_id(1)
+    block_start = n_idx * BLOCK_T
+    tokens = block_start + tl.arange(0, BLOCK_T)
+    mask = (tokens < N)[:, None]
+    half_d_offsets = tl.arange(0, D // 2)  # load half
+    if h_idx < HQ:
+        q_offset = tokens * stride_qn + h_idx * stride_qh
+
+        x1 = tl.load(
+            q_ptr + q_offset[:, None] + half_d_offsets[None, :], mask=mask, other=0
+        ).to(
+            tl.float32
+        )  # [BLOCK_T, D // 2]
+        x2 = tl.load(
+            q_ptr + q_offset[:, None] + half_d_offsets[None, :] + D // 2,
+            mask=mask,
+            other=0,
+        ).to(tl.float32)
+
+        rstd = tl.rsqrt((tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / D + eps)
+        x1 = x1 * rstd[:, None] * tl.load(q_norm_ptr + half_d_offsets).to(tl.float32)
+        x2 = (
+            x2
+            * rstd[:, None]
+            * tl.load(q_norm_ptr + D // 2 + half_d_offsets).to(tl.float32)
+        )
+    else:
+        k_offset = tokens * stride_kn + (h_idx - HQ) * stride_kh
+
+        x1 = tl.load(
+            k_ptr + k_offset[:, None] + half_d_offsets[None, :], mask=mask, other=0
+        ).to(
+            tl.float32
+        )  # [D // 2]
+        x2 = tl.load(
+            k_ptr + k_offset[:, None] + half_d_offsets[None, :] + D // 2,
+            mask=mask,
+            other=0,
+        ).to(tl.float32)
+
+        rstd = tl.rsqrt((tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / D + eps)
+        x1 = x1 * rstd[:, None] * tl.load(k_norm_ptr + half_d_offsets).to(tl.float32)
+        x2 = (
+            x2
+            * rstd[:, None]
+            * tl.load(k_norm_ptr + D // 2 + half_d_offsets).to(tl.float32)
+        )
+
+    cos = tl.load(
+        cos_ptr + tokens[:, None] * stride_cosn + half_d_offsets, mask=mask, other=0
+    ).to(
+        tl.float32
+    )  # [D // 2]
+    sin = tl.load(
+        sin_ptr + tokens[:, None] * stride_sinn + half_d_offsets, mask=mask, other=0
+    ).to(tl.float32)
+
+    out1 = x1 * cos - x2 * sin  # [D // 2]
+    out2 = x1 * sin + x2 * cos
+
+    if h_idx < HQ:
+        tl.store(
+            q_out_ptr
+            + tokens[:, None] * stride_qon
+            + h_idx * stride_qoh
+            + half_d_offsets,
+            out1,
+            mask=mask,
+        )
+        tl.store(
+            q_out_ptr
+            + tokens[:, None] * stride_qon
+            + h_idx * stride_qoh
+            + half_d_offsets
+            + D // 2,
+            out2,
+            mask=mask,
+        )
+    else:
+        tl.store(
+            k_out_ptr
+            + tokens[:, None] * stride_kon
+            + (h_idx - HQ) * stride_koh
+            + half_d_offsets,
+            out1,
+            mask=mask,
+        )
+        tl.store(
+            k_out_ptr
+            + tokens[:, None] * stride_kon
+            + (h_idx - HQ) * stride_koh
+            + half_d_offsets
+            + D // 2,
+            out2,
+            mask=mask,
+        )
+
+
+def fused_norm_rope_prefill(
+    q: torch.Tensor,  # bf16 [N, Hq, D], the prefill rows only: q[num_seqs_decoding:]
+    k: torch.Tensor,  # bf16 [N, Hkv, D]
+    q_norm_weight: torch.Tensor,  # [D]
+    k_norm_weight: torch.Tensor,
+    cos: torch.Tensor,  # [N, 1, D // 2]
+    sin: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:  # normed + roped (q, k), contiguous
+    N, Hq, D = q.shape
+    Hkv = k.shape[1]
+    assert q.stride(-1) == 1 and k.stride(-1) == 1, "kernel assumes contiguous head_dim"
+    assert cos.stride(-1) == 1 and sin.stride(-1) == 1
+    q_out = torch.empty(N, Hq, D, device=q.device, dtype=q.dtype)
+    k_out = torch.empty(N, Hkv, D, device=k.device, dtype=k.dtype)
+    BLOCK_T = 32
+    fused_norm_rope_prefill_kernel[(triton.cdiv(N, BLOCK_T), Hq + Hkv)](
+        q,
+        k,
+        q_norm_weight,
+        k_norm_weight,
+        cos,
+        sin,
+        q_out,
+        k_out,
+        q.stride(0),  # token
+        q.stride(1),  # head
+        k.stride(0),
+        k.stride(1),
+        cos.stride(0),
+        sin.stride(0),
+        q_out.stride(0),
+        q_out.stride(1),
+        k_out.stride(0),
+        k_out.stride(1),
+        N,
+        eps,
+        HQ=Hq,  # type: ignore
+        D=D,  # type: ignore
+        BLOCK_T=BLOCK_T,  # type: ignore
+    )
+    return q_out, k_out
+
+
+@triton.jit
 def quantize_kv_prefill_kernel(
     k_ptr,  # bf16 [N, Hkv, D], all sequences packed along N
     v_ptr,  # bf16 [N, Hkv, D]
@@ -668,6 +861,109 @@ def quantize_kv_prefill(
     )
 
 
+@triton.jit
+def dequantize_kv_prefix_kernel(
+    k_cache_ptr,  # int8 [pool, Hkv, max_len, D]
+    v_cache_ptr,  # int8 [pool, Hkv, max_len, D]
+    k_scale_ptr,  # fp32 [pool, Hkv, max_len]
+    v_scale_ptr,  # fp32 [pool, Hkv, max_len]
+    k_calibration_ptr,  # fp32 [pool, Hkv, 1, D]
+    k_out_ptr,  # bf16 [Hkv, total_cached, D], sequence b's prefix is rows [cu_cached[b], cu_cached[b+1])
+    v_out_ptr,  # bf16 [Hkv, total_cached, D]
+    cu_cached_ptr,  # int32 [B + 1]
+    slot_ids_ptr,
+    stride_cb,
+    stride_ch,
+    stride_cn,
+    stride_sb,
+    stride_sh,
+    stride_calb,
+    stride_calh,
+    stride_oh,
+    stride_on,
+    D: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    # the inverse of quantize_kv_prefill: k = int8 * k_scale * calibration, v = int8 * v_scale
+    b_idx = tl.program_id(axis=0)
+    h_idx = tl.program_id(axis=1)
+    out_start = tl.load(cu_cached_ptr + b_idx)
+    cached_len = tl.load(cu_cached_ptr + b_idx + 1) - out_start
+    slot = tl.load(slot_ids_ptr + b_idx)
+    d_offsets = tl.arange(0, D)
+    # the grid is sized for the longest prefix, so blocks past this sequence's prefix are fully masked
+    t_offsets = tl.program_id(axis=2) * BLOCK_T + tl.arange(0, BLOCK_T)
+    in_t = t_offsets < cached_len
+
+    cache_offsets = (
+        slot * stride_cb
+        + h_idx * stride_ch
+        + t_offsets[:, None] * stride_cn
+        + d_offsets[None, :]
+    )
+    scale_offsets = slot * stride_sb + h_idx * stride_sh + t_offsets
+    out_offsets = (
+        h_idx * stride_oh
+        + (out_start + t_offsets)[:, None] * stride_on
+        + d_offsets[None, :]
+    )
+
+    k = tl.load(k_cache_ptr + cache_offsets, mask=in_t[:, None], other=0).to(tl.float32)
+    k_scale = tl.load(k_scale_ptr + scale_offsets, mask=in_t, other=0.0)
+    calibration = tl.load(
+        k_calibration_ptr + slot * stride_calb + h_idx * stride_calh + d_offsets
+    )
+    k = k * k_scale[:, None] * calibration[None, :]
+    tl.store(k_out_ptr + out_offsets, k.to(tl.bfloat16), mask=in_t[:, None])
+
+    v = tl.load(v_cache_ptr + cache_offsets, mask=in_t[:, None], other=0).to(tl.float32)
+    v_scale = tl.load(v_scale_ptr + scale_offsets, mask=in_t, other=0.0)
+    tl.store(
+        v_out_ptr + out_offsets,
+        (v * v_scale[:, None]).to(tl.bfloat16),
+        mask=in_t[:, None],
+    )
+
+
+def dequantize_kv_prefix(
+    cache: LayerKVCache,
+    cu_cached: torch.Tensor,  # int32 [B + 1], prefix lengths of the prefilling sequences, cumulative
+    slot_ids: torch.Tensor,  # [B], kv cache row of each prefilling sequence
+    max_cached: int,  # longest prefix, sizes the grid
+    k_out: torch.Tensor,  # bf16 [Hkv, >= total_cached, D], shared by every layer
+    v_out: torch.Tensor,
+):
+    if max_cached == 0:
+        return
+    B, (_, Hkv, _, D) = cu_cached.shape[0] - 1, cache.k.shape
+    assert cache.k.stride() == cache.v.stride()
+    assert cache.k_scale.stride() == cache.v_scale.stride()
+    assert k_out.stride() == v_out.stride() and k_out.stride(-1) == 1
+    BLOCK_T = 64
+    dequantize_kv_prefix_kernel[(B, Hkv, triton.cdiv(max_cached, BLOCK_T))](
+        cache.k,
+        cache.v,
+        cache.k_scale,
+        cache.v_scale,
+        cache.k_calibration,
+        k_out,
+        v_out,
+        cu_cached,
+        slot_ids,
+        cache.k.stride(0),
+        cache.k.stride(1),
+        cache.k.stride(2),
+        cache.k_scale.stride(0),
+        cache.k_scale.stride(1),
+        cache.k_calibration.stride(0),
+        cache.k_calibration.stride(1),
+        k_out.stride(0),  # head
+        k_out.stride(1),  # token
+        D=D,  # type: ignore
+        BLOCK_T=BLOCK_T,  # type: ignore
+    )
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=st)
@@ -688,15 +984,11 @@ def prefill_attention_kernel(
     v_ptr,  # bf16 [N, Hkv, D]
     out_ptr,  # bf16 [N, Hq, D]
     seq_ids_ptr,  # [N] which sequence each packed token belongs to
-    cached_lens_ptr,  # [B], for every sequence: how many tokens have already been prefilled? 0 for pure prefill
     tile_start_ptr,
     cu_seqlens_ptr,
-    k_cache_ptr,
-    v_cache_ptr,
-    k_calibration_ptr,
-    k_scale_ptr,
-    v_scale_ptr,
-    slot_ids_ptr,
+    k_prefix_ptr,  # bf16 [Hkv, total_cached, D], from dequantize_kv_prefix
+    v_prefix_ptr,  # bf16 [Hkv, total_cached, D]
+    cu_cached_ptr,  # [B + 1], sequence b's cached prefix is rows [cu_cached[b], cu_cached[b+1])
     stride_qh,
     stride_qn,
     stride_kh,
@@ -705,18 +997,8 @@ def prefill_attention_kernel(
     stride_vn,
     stride_on,
     stride_oh,
-    stride_cachekb,
-    stride_cachekh,
-    stride_cachekn,
-    stride_cachevb,
-    stride_cachevh,
-    stride_cachevn,
-    stride_calibb,
-    stride_calibh,
-    stride_kscaleb,
-    stride_kscaleh,
-    stride_vscaleb,
-    stride_vscaleh,
+    stride_prefixh,
+    stride_prefixn,
     qk_scale,
     N,
     T_BUCKET,
@@ -733,8 +1015,8 @@ def prefill_attention_kernel(
 
     row_start = tl.load(tile_start_ptr + tile_idx)
     seq = tl.load(seq_ids_ptr + row_start)
-    slot = tl.load(slot_ids_ptr + seq)
-    cached_len = tl.load(cached_lens_ptr + seq)
+    prefix_start = tl.load(cu_cached_ptr + seq)
+    cached_len = tl.load(cu_cached_ptr + seq + 1) - prefix_start
     seq_start = tl.load(cu_seqlens_ptr + seq)
     seq_end = tl.load(cu_seqlens_ptr + seq + 1)
     d_offsets = tl.arange(0, D)
@@ -745,57 +1027,26 @@ def prefill_attention_kernel(
         q_ptr + stride_qh * hq_idx + start_m[:, None] * stride_qn + d_offsets[None, :],
         mask=q_seq_mask[:, None],
     )  # [BLOCK_M, D]
-    k_calibration = tl.load(
-        k_calibration_ptr + slot * stride_calibb + hkv_idx * stride_calibh + d_offsets
-    )
-    Qc = (Q * k_calibration).to(tl.bfloat16)
 
     max_old = tl.full((BLOCK_M,), value=float("-inf"), dtype=tl.float32)
     running_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, D), dtype=tl.float32)
 
+    # the cached prefix, already dequantized to bf16 with its scales applied
+    prefix_base = hkv_idx * stride_prefixh + prefix_start * stride_prefixn
     for i in range(0, cached_len, BLOCK_N):
         n_offsets = i + tl.arange(0, BLOCK_N)
         mask = n_offsets < cached_len  # [BLOCK_N]
-
-        K = tl.load(
-            k_cache_ptr
-            + slot * stride_cachekb
-            + hkv_idx * stride_cachekh
-            + n_offsets[:, None] * stride_cachekn
-            + d_offsets[None, :],
-            mask=mask[:, None],
-        ).to(
-            tl.bfloat16
-        )  # [BLOCK_N, D]
-
-        k_scale = tl.load(
-            k_scale_ptr + slot * stride_kscaleb + hkv_idx * stride_kscaleh + n_offsets,
-            mask=mask,
-            other=0.0,
+        kv_offsets = (
+            prefix_base + n_offsets[:, None] * stride_prefixn + d_offsets[None, :]
         )
 
+        K = tl.load(k_prefix_ptr + kv_offsets, mask=mask[:, None])  # [BLOCK_N, D]
         v = tl.load(
-            v_cache_ptr
-            + slot * stride_cachevb
-            + hkv_idx * stride_cachevh
-            + n_offsets[:, None] * stride_cachevn
-            + d_offsets[None, :],
-            mask=mask[:, None],
-            other=0.0,
-        ).to(
-            tl.bfloat16
+            v_prefix_ptr + kv_offsets, mask=mask[:, None], other=0.0
         )  # (BLOCK_N, D)
 
-        v_scale = tl.load(
-            v_scale_ptr + slot * stride_vscaleb + hkv_idx * stride_vscaleh + n_offsets,
-            mask=mask,
-            other=0.0,
-        )
-
-        attn_scores = (
-            tl.dot(Qc, tl.trans(K)) * k_scale[None, :] * qk_scale
-        )  # [BLOCK_M, BLOCK_N]
+        attn_scores = tl.dot(Q, tl.trans(K)) * qk_scale  # [BLOCK_M, BLOCK_N]
         attn_scores = tl.where(mask, attn_scores, float("-inf"))
 
         max_score = tl.max(attn_scores, axis=1)
@@ -806,9 +1057,7 @@ def prefill_attention_kernel(
         numerator = tl.exp2(attn_scores - safe_max_new[:, None])
         running_sum = running_sum * alpha + tl.sum(numerator, axis=1)
 
-        weighted_sum = tl.dot(
-            (numerator * v_scale[None, :]).to(v.dtype), v
-        )  # (BLOCK_M, D)
+        weighted_sum = tl.dot(numerator.to(v.dtype), v)  # (BLOCK_M, D)
         accumulator = accumulator * alpha[:, None] + weighted_sum
 
         max_old = max_new
@@ -874,16 +1123,17 @@ def prefill_attention(
     k: torch.Tensor,  # bf16 [N, Hkv, D]
     v: torch.Tensor,  # bf16 [N, Hkv, D]
     seq_ids: torch.Tensor,  # [N] which sequence each packed token belongs to
-    cached_lens: torch.Tensor,  # [B] int32, tokens already in the cache per sequence
     cu_seqlens: torch.Tensor,  # [B + 1] int32
     tile_start: torch.Tensor,  # [num_tiles] int32, first packed row of each tile, built with PREFILL_BLOCK_M
-    slot_ids: torch.Tensor,  # [B] int32, kv cache row of each sequence
-    kv_cache: LayerKVCache,
+    k_prefix: torch.Tensor,  # bf16 [Hkv, total_cached, D], the cached prefixes from dequantize_kv_prefix
+    v_prefix: torch.Tensor,  # bf16 [Hkv, total_cached, D]
+    cu_cached: torch.Tensor,  # [B + 1] int32, where each sequence's prefix starts in k_prefix/v_prefix
     PREFILL_BLOCK_M: int,  # must be the same value tile_start was built with
 ) -> torch.Tensor:  # bf16 [N, Hq, D]
     N, Hq, D = q.shape
     Hkv = k.shape[1]
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+    assert k_prefix.stride() == v_prefix.stride() and k_prefix.stride(-1) == 1
     out = torch.empty(N, Hq, D, device=q.device, dtype=q.dtype)
     prefill_attention_kernel[(tile_start.shape[0], Hq)](
         q,
@@ -891,15 +1141,11 @@ def prefill_attention(
         v,
         out,
         seq_ids,
-        cached_lens,
         tile_start,
         cu_seqlens,
-        kv_cache.k,
-        kv_cache.v,
-        kv_cache.k_calibration,
-        kv_cache.k_scale,
-        kv_cache.v_scale,
-        slot_ids,
+        k_prefix,
+        v_prefix,
+        cu_cached,
         q.stride(1),  # head
         q.stride(0),  # token
         k.stride(1),
@@ -908,18 +1154,8 @@ def prefill_attention(
         v.stride(0),
         out.stride(0),  # token
         out.stride(1),  # head
-        kv_cache.k.stride(0),
-        kv_cache.k.stride(1),
-        kv_cache.k.stride(2),
-        kv_cache.v.stride(0),
-        kv_cache.v.stride(1),
-        kv_cache.v.stride(2),
-        kv_cache.k_calibration.stride(0),
-        kv_cache.k_calibration.stride(1),
-        kv_cache.k_scale.stride(0),
-        kv_cache.k_scale.stride(1),
-        kv_cache.v_scale.stride(0),
-        kv_cache.v_scale.stride(1),
+        k_prefix.stride(0),  # head
+        k_prefix.stride(1),  # token
         D**-0.5
         * 1.4426950408889634,  # qk_scale, log2(e) folded in for exp2. saves a PTX instruction
         N,
