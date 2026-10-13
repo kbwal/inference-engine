@@ -211,23 +211,10 @@ def poisson_arrivals(n: int, rate: float, seed: int) -> list[float]:
     return arrivals
 
 
-def is_graph_step(engine: Engine) -> bool:
-    # mirrors Engine.step: it replays a cuda graph iff every running request is decoding and
-    # nothing gets admitted. admission happens whenever something waits and a slot is free,
-    # since the budget left after decodes is always >= min_first_chunk
-    running = engine.currently_processing_list
-    return (
-        bool(running)
-        and all(r.cached_len >= len(r.prompt_ids) for r in running)
-        and not (engine.waiting_queue and engine.free_slots)
-    )
-
-
 def serve(engine: Engine, work, arrivals: list[float]):
     # submit each request once its arrival time has passed, step whenever there's work, idle otherwise.
-    # returns (requests, elapsed seconds, per step: (was a graph replay, batch size, seconds))
+    # returns (requests, elapsed seconds)
     reqs: list[Request] = []
-    steps: list[tuple[bool, int, float]] = []
     start = time.perf_counter()
     i = 0
     while i < len(work) or engine.waiting_queue or engine.currently_processing_list:
@@ -240,15 +227,11 @@ def serve(engine: Engine, work, arrivals: list[float]):
             reqs.append(req)
             i += 1
         if engine.waiting_queue or engine.currently_processing_list:
-            graph = is_graph_step(engine)
-            batch = len(engine.currently_processing_list)
-            t = time.perf_counter()
-            with torch.cuda.nvtx.range(f"step {"graph" if graph else "eager"}"):
-                engine.step()  # ends with a .tolist(), so the gpu work is done when it returns
-            steps.append((graph, batch, time.perf_counter() - t))
+            with torch.cuda.nvtx.range("step"):
+                engine.step()
         elif i < len(work):
             time.sleep(max(0.0, arrivals[i] - (time.perf_counter() - start)))
-    return reqs, time.perf_counter() - start, steps
+    return reqs, time.perf_counter() - start
 
 
 def warmup_prefill_buckets(engine: Engine, prompt: list[int]) -> None:
@@ -284,16 +267,15 @@ def bench_serve(model, prompts: Prompts, args) -> None:
 
     print(
         f"{'rate/s':>6} | {'ttft p50':>8} | {'ttft p99':>8} | {'tpot p50':>8} | {'tpot p99':>8} | "
-        f"{'out tok/s':>9} | {'req/s':>5} | {'goodput':>12} || {'graph':>5} | {'graph':>5} | {'graph':>5} | {'eager':>5}"
+        f"{'out tok/s':>9} | {'req/s':>5} | {'goodput':>12}"
     )
     print(
-        f"{'':>6} | {'(ms)':>8} | {'(ms)':>8} | {'(ms)':>8} | {'(ms)':>8} | {'':>9} | {'':>5} | {'req/s (%)':>12} || "
-        f"{'steps':>5} | {'batch':>5} | {'ms':>5} | {'ms':>5}"
+        f"{'':>6} | {'(ms)':>8} | {'(ms)':>8} | {'(ms)':>8} | {'(ms)':>8} | {'':>9} | {'':>5} | {'req/s (%)':>12}"
     )
     for rate in args.rates:
         arrivals = poisson_arrivals(len(work), rate, args.seed + 1)
         torch.cuda.profiler.start()
-        reqs, elapsed, steps = serve(engine, work, arrivals)
+        reqs, elapsed = serve(engine, work, arrivals)
         torch.cuda.profiler.stop()
 
         ttfts = [r.t_first_token - r.t_submit for r in reqs]  # type: ignore
@@ -304,21 +286,13 @@ def bench_serve(model, prompts: Prompts, args) -> None:
             if a * 1000 <= args.slo_ttft_ms
             and (b is None or b * 1000 <= args.slo_tpot_ms)
         )
-        graph = [(batch, s) for is_graph, batch, s in steps if is_graph]
-        eager = [s for is_graph, _, s in steps if not is_graph]
         tpots = [t for t in tpots if t is not None]
         print(
             f"{rate:>6g} | {pct(ttfts, 50) * 1000:>8.0f} | {pct(ttfts, 99) * 1000:>8.0f} | "
             f"{pct(tpots, 50) * 1000:>8.1f} | {pct(tpots, 99) * 1000:>8.1f} | "
             f"{sum(len(r.output) for r in reqs) / elapsed:>9.0f} | {len(reqs) / elapsed:>5.1f} | "
-            f"{good / elapsed:>5.1f} ({good / len(reqs) * 100:>3.0f}%) || "
-            f"{len(graph) / len(steps) * 100:>4.0f}% | {mean([b for b, _ in graph]):>5.1f} | "
-            f"{mean([s for _, s in graph]) * 1000:>5.1f} | {mean(eager) * 1000:>5.1f}"
+            f"{good / elapsed:>5.1f} ({good / len(reqs) * 100:>3.0f}%)"
         )
-    print(
-        "\n   right of ||: share of steps that replayed a cuda graph, their mean batch size, and mean step time "
-        "for graph vs eager (prefill-carrying) steps"
-    )
 
 
 # main

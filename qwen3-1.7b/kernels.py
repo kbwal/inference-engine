@@ -18,7 +18,7 @@ class LayerKVCache:
 @triton.jit
 def compute_piece(
     cached_lens_ptr,
-    batch_size,
+    num_decoding,
     BLOCK_B: tl.constexpr,
     MIN_PIECE: tl.constexpr,
     TARGET: tl.constexpr,
@@ -28,7 +28,7 @@ def compute_piece(
     # the attention and combine kernels both call this, so they always agree on the splits
     b_offsets = tl.arange(0, BLOCK_B)
     cached_lens = tl.load(
-        cached_lens_ptr + b_offsets, mask=b_offsets < batch_size, other=-1
+        cached_lens_ptr + b_offsets, mask=b_offsets < num_decoding, other=-1
     )  # masked lanes become n_end = 0, so they don't count
     total = tl.sum(cached_lens + 1)
     piece = tl.maximum(MIN_PIECE, tl.cdiv(total, TARGET))
@@ -38,7 +38,7 @@ def compute_piece(
 @triton.jit
 def assign_work(
     cached_lens_ptr,
-    batch_size,
+    num_decoding,
     work,  # this program's index in the work list
     BLOCK_B: tl.constexpr,
     MIN_PIECE: tl.constexpr,
@@ -46,18 +46,19 @@ def assign_work(
 ):
     # the work list is every sequence's pieces laid end to end: seq 0's pieces, then seq 1's, ...
     # find which (sequence, piece) entry `work` is. programs past the end get needed = 0
-    piece = compute_piece(cached_lens_ptr, batch_size, BLOCK_B, MIN_PIECE, TARGET)
+    piece = compute_piece(cached_lens_ptr, num_decoding, BLOCK_B, MIN_PIECE, TARGET)
     b_offsets = tl.arange(0, BLOCK_B)
     n_ends = (
-        tl.load(cached_lens_ptr + b_offsets, mask=b_offsets < batch_size, other=-1) + 1
+        tl.load(cached_lens_ptr + b_offsets, mask=b_offsets < num_decoding, other=-1)
+        + 1
     )
     splits = tl.cdiv(n_ends, piece)  # pieces per sequence, 0 for masked lanes
     ends = tl.cumsum(splits, axis=0)  # work index one past each sequence's last piece
     # sequences that end at or before `work` come before it, so their count is our sequence
     b_idx = tl.sum((ends <= work).to(tl.int32))
-    valid = b_idx < batch_size
-    b_idx = tl.minimum(
-        b_idx, batch_size - 1
+    valid = b_idx < num_decoding
+    b_idx = tl.maximum(
+        tl.minimum(b_idx, num_decoding - 1), 0
     )  # keep loads in bounds for invalid programs
     is_b = b_offsets == b_idx
     split_idx = work - tl.sum(
@@ -86,6 +87,7 @@ def decode_attention_kernel(
     k_scale_ptr,
     v_scale_ptr,
     cached_lens_ptr,
+    num_decoding_ptr,
     partial_accumulation_ptr,
     partial_max_ptr,
     partial_running_sum_ptr,
@@ -100,7 +102,6 @@ def decode_attention_kernel(
     stride_sb,
     stride_sh,
     scale,
-    num_batches,
     max_len,
     GQA_RATIO: tl.constexpr,
     D: tl.constexpr,
@@ -110,13 +111,14 @@ def decode_attention_kernel(
     TARGET: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
 ):
+    num_decoding = tl.load(num_decoding_ptr)
     d_offsets = tl.arange(0, D)
     h_offsets = tl.arange(0, 16)
     h_valid = h_offsets < GQA_RATIO
 
     # axis 0 walks the work list of (sequence, piece) entries, axis 1 is the kv head
     b_idx, split_idx, needed, piece = assign_work(
-        cached_lens_ptr, num_batches, tl.program_id(axis=0), BLOCK_B, MIN_PIECE, TARGET
+        cached_lens_ptr, num_decoding, tl.program_id(axis=0), BLOCK_B, MIN_PIECE, TARGET
     )
     h_idx = tl.program_id(axis=1)  # head
     slot = tl.load(slot_ids_ptr + b_idx)
@@ -216,9 +218,9 @@ def decode_attention_combine_kernel(
     partial_running_sum_ptr,
     output_ptr,
     cached_lens_ptr,
+    num_decoding_ptr,
     stride_ob,
     stride_oh,
-    num_batches,
     HQ: tl.constexpr,
     D: tl.constexpr,
     BLOCK_B: tl.constexpr,
@@ -226,13 +228,16 @@ def decode_attention_combine_kernel(
     TARGET: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
 ):
+    num_decoding = tl.load(num_decoding_ptr)
     b_idx = tl.program_id(axis=0)
+    if b_idx >= num_decoding:
+        return
     q_head = tl.program_id(axis=1)
     s = tl.arange(0, MAX_SPLITS)
     d_offsets = tl.arange(0, D)
     rows = (b_idx * HQ + q_head) * MAX_SPLITS + s
 
-    piece = compute_piece(cached_lens_ptr, num_batches, BLOCK_B, MIN_PIECE, TARGET)
+    piece = compute_piece(cached_lens_ptr, num_decoding, BLOCK_B, MIN_PIECE, TARGET)
     cached_len = tl.load(cached_lens_ptr + b_idx)
     needed = tl.cdiv(cached_len + 1, piece)
     valid = s < needed
@@ -267,8 +272,12 @@ def decode_attention(
     kv_cache: LayerKVCache,
     cached_lens: torch.Tensor,  # [B], tokens already cached per sequence
     slot_ids: torch.Tensor,  # [B], kv cache row of each sequence
+    num_decoding: torch.Tensor,  # a single number saying how many tokens are in decode
     scale,
-):  # -> [B, Hq, D]
+    # [>= B, Hq, D]. if given, decoding entry b's output goes to row b of this instead of a new
+    # tensor, so a mixed step's decode and prefill attention can fill one buffer
+    out: torch.Tensor | None = None,
+):  # -> [B, Hq, D], or out
     k_cache, v_cache = kv_cache.k, kv_cache.v
     assert (
         k_cache.stride() == v_cache.stride()
@@ -276,7 +285,9 @@ def decode_attention(
     assert kv_cache.k_scale.stride() == kv_cache.v_scale.stride()
     B, Hq, D = q.shape
     Hkv = k_cache.shape[1]
-    out = torch.empty(B, Hq, D, device=q.device, dtype=q.dtype)
+    if out is None:
+        out = torch.empty(B, Hq, D, device=q.device, dtype=q.dtype)
+    assert out.shape[0] >= B and out.shape[1:] == (Hq, D) and out.stride(-1) == 1
 
     PROGRAMS_PER_SM = 4  # a memory bound kernel needs several programs per SM in flight to hide latency
     MIN_PIECE = 64  # smallest kv piece per program. below this, writing partials costs more than the kv read
@@ -306,6 +317,7 @@ def decode_attention(
         kv_cache.k_scale,
         kv_cache.v_scale,
         cached_lens,
+        num_decoding,
         partial_accumulator,
         partial_maxes,
         partial_running_sum,
@@ -320,7 +332,6 @@ def decode_attention(
         kv_cache.k_scale.stride(dim=0),
         kv_cache.k_scale.stride(dim=1),
         scale,
-        num_batches=B,
         max_len=triton.next_power_of_2(k_cache.shape[2]),
         GQA_RATIO=Hq // Hkv,
         D=D,
@@ -335,9 +346,9 @@ def decode_attention(
         partial_running_sum,
         out,
         cached_lens,
+        num_decoding,
         out.stride(dim=0),
         out.stride(dim=1),
-        B,
         HQ=Hq,  # type: ignore
         D=D,  # type: ignore
         BLOCK_B=block_b,  # type: ignore
@@ -357,6 +368,7 @@ def fused_rope_kv_decode_kernel(
     k_norm_ptr,
     output_ptr,
     cached_lens_ptr,
+    num_decoding_ptr,
     k_cache_ptr,
     v_cache_ptr,
     k_scale_ptr,
@@ -387,7 +399,10 @@ def fused_rope_kv_decode_kernel(
     GQA_RATIO: tl.constexpr,
     D: tl.constexpr,
 ):
+    num_decoding = tl.load(num_decoding_ptr)
     b_idx = tl.program_id(axis=0)
+    if b_idx >= num_decoding:
+        return
     h_idx = tl.program_id(axis=1)
 
     half_d_offsets = tl.arange(0, D // 2)  # load half
@@ -474,6 +489,7 @@ def fused_rope_kv_decode(
     slot_ids: torch.Tensor,  # [B], list of ints that points to the row holding this sequence's cache
     kv_cache: LayerKVCache,
     cached_lens: torch.Tensor,  # [B], tokens already in the kv cache per sequence
+    num_decoding: torch.Tensor,
     eps: float,
 ):
     # returns normed + roped q and writes kv cache
@@ -492,6 +508,7 @@ def fused_rope_kv_decode(
         k_norm_weight,
         out,
         cached_lens,
+        num_decoding,
         kv_cache.k,
         kv_cache.v,
         kv_cache.k_scale,
@@ -551,31 +568,8 @@ def fused_norm_rope_prefill_kernel(
     D: tl.constexpr,
     BLOCK_T: tl.constexpr,  # tokens per program
 ):
-    # prefill version of the norm + rope half of fused_rope_kv_decode_kernel: replaces
-    # self.rope(self.q_norm(q)) and self.rope(self.k_norm(k)) in AttentionLayer.forward, about 16
-    # small kernel launches per layer, with one.
-    #
-    # grid: (cdiv(N, BLOCK_T), Hq + Hkv). one program = BLOCK_T tokens of one head. like the decode
-    # kernel, heads [0, HQ) are q heads and [HQ, HQ + Hkv) are k heads.
-    # e.g. a 124 token prompt with BLOCK_T = 32 -> 4 token blocks x 24 heads = 96 programs.
-    # program (3, 20) handles tokens 96..127 of k head 20 - 16 = 4, but only 96..123 exist.
-    #
-    # the int8 cache write (quantize_kv_prefill) stays a separate kernel: on a sequence's first chunk
-    # it needs the max over ALL of that sequence's tokens (the calibration) before it can quantize
-    # any of them, and programs here only ever see BLOCK_T tokens.
-    #
-    # TODO 1: this program's tokens and head. a [BLOCK_T] vector of token indices and a mask for
-    #         the ones past N (the last block is usually partial).
-    # TODO 2: pick q or k by head, the same if/else as the decode kernel: the input pointer +
-    #         strides, the norm weight, and where the output goes.
-    # TODO 3: load the two halves x1, x2. each is now 2D, [BLOCK_T, D // 2], not [D // 2]:
-    #         token offsets go down the rows, dim offsets across the columns.
-    # TODO 4: rms norm in fp32. one rstd PER TOKEN, so you reduce across dims (axis=1). the decode
-    #         kernel reduces axis=0 because there it's a single row. then multiply by the weight
-    #         halves, broadcast across rows.
-    # TODO 5: load cos and sin for these tokens ([BLOCK_T, D // 2], the same rows as x) and rotate:
-    #         out1 = x1 * cos - x2 * sin, out2 = x1 * sin + x2 * cos.
-    # TODO 6: store both halves to q_out or k_out, masked like the loads.
+    # prefill version of the norm + rope half of fused_rope_kv_decode_kernel
+    # replaces norm + rope in the attention layer
     n_idx, h_idx = tl.program_id(0), tl.program_id(1)
     block_start = n_idx * BLOCK_T
     tokens = block_start + tl.arange(0, BLOCK_T)
@@ -730,6 +724,7 @@ def quantize_kv_prefill_kernel(
     cu_seqlens_ptr,  # int32 [B + 1], sequence i is packed tokens [cu_seqlens[i], cu_seqlens[i+1])
     slot_ids_ptr,
     cached_lens_ptr,
+    num_decoding_ptr,
     stride_kh,
     stride_kt,
     stride_vh,
@@ -745,7 +740,10 @@ def quantize_kv_prefill_kernel(
     D: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
+    num_decoding = tl.load(num_decoding_ptr)
     b_idx = tl.program_id(axis=0)
+    if b_idx < num_decoding:
+        return
     h_idx = tl.program_id(axis=1)
     slot = tl.load(slot_ids_ptr + b_idx)
     d_offsets = tl.arange(0, D)
@@ -753,6 +751,8 @@ def quantize_kv_prefill_kernel(
     seq_start = tl.load(cu_seqlens_ptr + b_idx * stride_cuseqb)
     # how many tokens am i writing?
     chunk_len = tl.load(cu_seqlens_ptr + (b_idx + 1) * stride_cuseqb) - seq_start
+    if chunk_len == 0:
+        return
     # how many tokens do i already have?
     cached_len = tl.load(cached_lens_ptr + b_idx)
 
@@ -827,6 +827,7 @@ def quantize_kv_prefill(
     cu_seqlens: torch.Tensor,  # int32 [B + 1]
     slot_ids: torch.Tensor,  # [B], sequence i is written to cache row slot_ids[i]
     cached_lens: torch.Tensor,  # [B], new tokens are written starting at this column
+    num_decoding: torch.Tensor,  # a single number that says how many tokens are in decode
     cache: LayerKVCache,
 ):
     N, Hkv, D = k.shape
@@ -844,6 +845,7 @@ def quantize_kv_prefill(
         cu_seqlens,
         slot_ids,
         cached_lens,
+        num_decoding,
         k.stride(1),  # head
         k.stride(0),  # token
         v.stride(1),
@@ -889,9 +891,12 @@ def dequantize_kv_prefix_kernel(
     h_idx = tl.program_id(axis=1)
     out_start = tl.load(cu_cached_ptr + b_idx)
     cached_len = tl.load(cu_cached_ptr + b_idx + 1) - out_start
+    # the grid is sized for max_len, so most programs have no rows. leave before loading anything
+    # else: with ~33 entries x 8 heads x max_len / 64 programs per layer, that adds up
+    if tl.program_id(axis=2) * BLOCK_T >= cached_len:
+        return
     slot = tl.load(slot_ids_ptr + b_idx)
     d_offsets = tl.arange(0, D)
-    # the grid is sized for the longest prefix, so blocks past this sequence's prefix are fully masked
     t_offsets = tl.program_id(axis=2) * BLOCK_T + tl.arange(0, BLOCK_T)
     in_t = t_offsets < cached_len
 
@@ -927,20 +932,19 @@ def dequantize_kv_prefix_kernel(
 
 def dequantize_kv_prefix(
     cache: LayerKVCache,
-    cu_cached: torch.Tensor,  # int32 [B + 1], prefix lengths of the prefilling sequences, cumulative
-    slot_ids: torch.Tensor,  # [B], kv cache row of each prefilling sequence
-    max_cached: int,  # longest prefix, sizes the grid
+    cu_cached: torch.Tensor,  # int32 [B + 1], prefix lengths of every entry, cumulative. decoders and unused entries are 0
+    slot_ids: torch.Tensor,  # [B], kv cache row of each entry
     k_out: torch.Tensor,  # bf16 [Hkv, >= total_cached, D], shared by every layer
     v_out: torch.Tensor,
 ):
-    if max_cached == 0:
-        return
-    B, (_, Hkv, _, D) = cu_cached.shape[0] - 1, cache.k.shape
+    # always launches, with a grid that only depends on the cache's shape, so it can be captured.
+    # an empty step just has every program fully masked
+    B, (_, Hkv, max_len, D) = cu_cached.shape[0] - 1, cache.k.shape
     assert cache.k.stride() == cache.v.stride()
     assert cache.k_scale.stride() == cache.v_scale.stride()
     assert k_out.stride() == v_out.stride() and k_out.stride(-1) == 1
     BLOCK_T = 64
-    dequantize_kv_prefix_kernel[(B, Hkv, triton.cdiv(max_cached, BLOCK_T))](
+    dequantize_kv_prefix_kernel[(B, Hkv, triton.cdiv(max_len, BLOCK_T))](
         cache.k,
         cache.v,
         cache.k_scale,
@@ -1014,6 +1018,8 @@ def prefill_attention_kernel(
     hkv_idx = hq_idx // GQA_RATIO
 
     row_start = tl.load(tile_start_ptr + tile_idx)
+    if row_start < 0:
+        return
     seq = tl.load(seq_ids_ptr + row_start)
     prefix_start = tl.load(cu_cached_ptr + seq)
     cached_len = tl.load(cu_cached_ptr + seq + 1) - prefix_start
