@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.cuda.tunable as tunable
 from torch.cuda import nvtx
-from kernels import sample
+from kernels import sample, tune_linear
 from collections import deque
 
 TUNABLEOP_FILE = os.path.join(os.path.dirname(__file__), "tunableop_results.csv")
@@ -107,6 +107,10 @@ class Engine:
         self.graph_pool = torch.cuda.graph_pool_handle()
         # pure decode steps, by batch size
         self.graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
+        self.graph_buckets = sorted(
+            {min(1 << i, max_batch_size) for i in range(max_batch_size.bit_length() + 1)}
+        )
+        self.tune_matmuls()
         self.capture_decode_graphs()
         # steps with prefill, by token bucket
         self.prefill_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
@@ -346,6 +350,30 @@ class Engine:
         return cu_cached[-1]
 
     @torch.inference_mode()
+    def tune_matmuls(self) -> None:
+        # pick skinny_matmul or cublas for every matmul shape the graphs will run (see tune_linear).
+        # a graph's row count is fixed, so the pick made here is what each graph records
+        layer = self.model.model.layers[0]
+        weights = [
+            layer.self_attn.qkv_proj.weight,
+            layer.self_attn.o_proj.weight,
+            layer.mlp.gate_up_proj.weight,
+            layer.mlp.down_proj.weight,
+        ]
+        lm_head = (
+            self.model.model.embed_tokens.weight
+            if self.model.lm_head is None
+            else self.model.lm_head.weight
+        )
+        # tunableop tunes cublas for new shapes the first time it sees them, like capture warmup does
+        tunable.tuning_enable(tunable.is_enabled())
+        # layers run one row per token: decode buckets, and the token buckets of steps with prefill
+        tune_linear(weights, self.graph_buckets + self.token_buckets)
+        # lm_head runs one row per entry: decode buckets, and every entry in a step with prefill
+        tune_linear([lm_head], self.graph_buckets + [self.num_entries])
+        tunable.tuning_enable(False)
+
+    @torch.inference_mode()
     def capture_decode_graphs(self) -> None:
         B = self.max_batch_size
         # inputs live at fixed addresses
@@ -355,7 +383,6 @@ class Engine:
         self.graph_slot_ids = torch.full(
             (B,), self.scratch_slot, device=self.device, dtype=torch.int32
         )
-        self.graph_buckets = sorted({min(1 << i, B) for i in range(B.bit_length() + 1)})
         # every row of bucket b decodes (padded rows on the scratch slot), so its count is the
         # constant b. one tensor per bucket, made before capture since a graph can't create one
         # from a python number, and kept here because the graph reads it at a fixed address

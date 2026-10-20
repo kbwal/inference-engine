@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.cuda import nvtx
 from kernels import (
     LayerKVCache,
@@ -13,6 +12,7 @@ from kernels import (
     prefill_attention,
     silu_mul,
     add_rms_norm,
+    linear,
 )
 
 
@@ -82,7 +82,7 @@ class AttentionLayer(nn.Module):
     ):
         N = x.shape[0]
         with nvtx.range("qkv_proj"):
-            q, k, v = self.qkv_proj(x).split(
+            q, k, v = linear(x, self.qkv_proj.weight).split(
                 [
                     self.head_dim * self.num_q_heads,
                     self.head_dim * self.num_kv_heads,
@@ -198,7 +198,8 @@ class AttentionLayer(nn.Module):
             )
 
         with nvtx.range("o_proj"):
-            return self.o_proj(out.view(N, -1))  # out is [N, Hq, head_dim]
+            # out is [N, Hq, head_dim]
+            return linear(out.view(N, -1), self.o_proj.weight)
 
 
 class MLPLayer(nn.Module):
@@ -219,8 +220,8 @@ class MLPLayer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         # x does not include tokens in kv cache
-        gate_up = self.gate_up_proj(x)
-        return self.down_proj(silu_mul(gate_up))
+        gate_up = linear(x, self.gate_up_proj.weight)
+        return linear(silu_mul(gate_up), self.down_proj.weight)
 
 
 class TransformerBlock(nn.Module):
@@ -483,7 +484,7 @@ class Qwen3_1_7B(nn.Module):
                 if self.lm_head is None
                 else self.lm_head.weight
             )
-            return F.linear(x, w)
+            return linear(x, w)
 
 
 def make_qwen_1_7(

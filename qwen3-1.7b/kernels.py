@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
+import triton.testing
 import torch
+import torch.nn.functional as F
 from triton.language.extra import libdevice
 from dataclasses import dataclass
 import functools
@@ -1366,3 +1368,118 @@ def sample(logits: torch.Tensor, tau: float, seed: torch.Tensor) -> torch.Tensor
     )
     seed.add_(1)
     return out
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": bn, "BLOCK_K": bk}, num_warps=w, num_stages=st)
+        for bn in [32, 64, 128]
+        for bk in [64, 128, 256]
+        for w in [4, 8]
+        for st in [2, 3, 4]
+        if not (w == 8 and bn == 32)
+    ],
+    # runtime doesn't depend on the values in x or the weight, so tuning on any data is fine
+    key=["N", "K", "BLOCK_M"],
+    cache_results=True,
+)
+@triton.jit
+def skinny_matmul_kernel(
+    x_ptr,  # bf16 [M, K], activations
+    weight_ptr,  # bf16 [N, K], weight rows, same layout as nn.Linear.weight
+    y_ptr,  # bf16 [M, N], y = x @ weight.T
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_wn,
+    stride_ym,
+    BLOCK_M: tl.constexpr,  # >= M, so every program covers all of M and reads its weights once
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    mask = (tl.arange(0, BLOCK_M) < M)[:, None]
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        w = tl.load(
+            weight_ptr
+            + ((pid * BLOCK_N + (tl.arange(0, BLOCK_N))) * stride_wn)[None, :]
+            + (k_start + tl.arange(0, BLOCK_K))[:, None]
+        )
+        x = tl.load(
+            x_ptr
+            + (tl.arange(0, BLOCK_M) * stride_xm)[:, None]
+            + (k_start + tl.arange(0, BLOCK_K))[None, :],
+            mask=mask,
+            other=0.0,
+        )
+        accumulator += tl.dot(x, w)
+
+    tl.store(
+        y_ptr
+        + pid * BLOCK_N
+        + (tl.arange(0, BLOCK_M) * stride_ym)[:, None]
+        + tl.arange(0, BLOCK_N)[None, :],
+        accumulator.to(tl.bfloat16),
+        mask=mask,
+    )
+
+
+def skinny_matmul(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:  # [M, K] bf16, [N, K] bf16 -> [M, N] bf16
+    # matmul for few rows (decode), where reading the weight is the whole cost. one program per
+    # BLOCK_N weight rows covering all of M, so every weight byte is read once. cublas reads these
+    # shapes at ~500-800 GB/s, this at ~750-880
+    M, K = x.shape
+    N = weight.shape[0]
+    assert x.stride(-1) == 1 and weight.stride(-1) == 1
+    assert M <= 64, "big M is compute bound, cublas is faster there"
+    # every BLOCK_N / BLOCK_K in the configs divides these, so neither needs a mask
+    assert N % 128 == 0 and K % 256 == 0
+    y = torch.empty(M, N, device=x.device, dtype=torch.bfloat16)
+    BLOCK_M = max(16, triton.next_power_of_2(M))  # tl.dot needs every dim >= 16
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
+    skinny_matmul_kernel[grid](
+        x,
+        weight,
+        y,
+        M,
+        N,
+        K,
+        x.stride(0),
+        weight.stride(0),
+        y.stride(0),
+        BLOCK_M=BLOCK_M,  # type: ignore
+    )
+    return y
+
+
+# (N, K, M) -> whether skinny_matmul beat cublas for that weight shape and row count. filled by
+# tune_linear before graph capture, anything it never measured uses cublas
+use_skinny: dict[tuple[int, int, int], bool] = {}
+
+
+def linear(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:  # [M, K] @ [N, K].T -> [M, N], with whichever measured faster
+    if use_skinny.get((weight.shape[0], weight.shape[1], x.shape[0]), False):
+        return skinny_matmul(x, weight)
+    return F.linear(x, weight)
+
+
+def tune_linear(weights: list[torch.Tensor], rows: list[int]) -> None:
+    # times skinny_matmul against cublas for each weight shape at each row count and keeps the
+    # faster one. do_bench clears l2 before every run, like the real model where each layer's
+    # weights come from dram. a few shapes are within ~3%, so skinny_matmul needs a 2% win to switch
+    for weight in weights:
+        N, K = weight.shape
+        for M in rows:
+            if M > 64 or (N, K, M) in use_skinny:
+                continue
+            x = torch.randn(M, K, device=weight.device, dtype=weight.dtype)
+            skinny = triton.testing.do_bench(lambda: skinny_matmul(x, weight), return_mode="median")
+            cublas = triton.testing.do_bench(lambda: F.linear(x, weight), return_mode="median")
+            use_skinny[(N, K, M)] = skinny < 0.98 * cublas
